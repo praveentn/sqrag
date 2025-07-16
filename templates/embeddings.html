@@ -1,0 +1,961 @@
+<!-- templates/embeddings.html -->
+{% extends "base.html" %}
+
+{% block title %}Embedding Indexes - RAG Data Platform{% endblock %}
+
+{% block page_title %}Embedding & Index Console{% endblock %}
+
+{% block header_actions %}
+<div class="btn-group">
+    <button class="btn btn-primary" onclick="showCreateIndexModal()">
+        <i class="fas fa-plus me-2"></i>Create Index
+    </button>
+    <button class="btn btn-outline-secondary" onclick="refreshIndexes()">
+        <i class="fas fa-refresh me-2"></i>Refresh
+    </button>
+    <button class="btn btn-outline-warning" onclick="cleanupJobs()">
+        <i class="fas fa-broom me-2"></i>Cleanup
+    </button>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <!-- Overview Cards -->
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card">
+            <div class="metric-value" id="totalIndexes">-</div>
+            <div class="metric-label">Total Indexes</div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+            <div class="metric-value" id="readyIndexes">-</div>
+            <div class="metric-label">Ready Indexes</div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            <div class="metric-value" id="buildingIndexes">-</div>
+            <div class="metric-label">Building</div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+            <div class="metric-value" id="totalItems">-</div>
+            <div class="metric-label">Indexed Items</div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <!-- Active Jobs -->
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h6 class="mb-0">
+                    <i class="fas fa-cogs me-2"></i>
+                    Active Jobs
+                </h6>
+                <button class="btn btn-sm btn-outline-primary" onclick="refreshActiveJobs()">
+                    <i class="fas fa-refresh"></i>
+                </button>
+            </div>
+            <div class="card-body p-0">
+                <div id="activeJobsList" style="max-height: 300px; overflow-y: auto;">
+                    <div class="text-center p-3">
+                        <div class="loading-spinner me-2"></div>
+                        Loading active jobs...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Index Performance -->
+    <div class="col-md-6 mb-3">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="mb-0">
+                    <i class="fas fa-chart-bar me-2"></i>
+                    Index Performance
+                </h6>
+            </div>
+            <div class="card-body">
+                <canvas id="indexPerformanceChart" height="200"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">
+                    <i class="fas fa-vector-square me-2"></i>
+                    Embedding Indexes
+                </h5>
+                <div class="d-flex gap-2">
+                    <select class="form-select form-select-sm" id="scopeFilter" 
+                            onchange="filterIndexes()" style="width: auto;">
+                        <option value="">All Scopes</option>
+                        <option value="table">Tables</option>
+                        <option value="column">Columns</option>
+                        <option value="dictionary">Dictionary</option>
+                    </select>
+                    <select class="form-select form-select-sm" id="statusFilter" 
+                            onchange="filterIndexes()" style="width: auto;">
+                        <option value="">All Status</option>
+                        <option value="ready">Ready</option>
+                        <option value="building">Building</option>
+                        <option value="error">Error</option>
+                        <option value="pending">Pending</option>
+                    </select>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div id="indexesContainer">
+                    <div class="text-center p-4">
+                        <div class="loading-spinner me-2"></div>
+                        Loading embedding indexes...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create Index Modal -->
+<div class="modal fade" id="createIndexModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Create Embedding Index</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="createIndexForm">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Index Name *</label>
+                                <input type="text" class="form-control" id="indexName" required 
+                                       placeholder="e.g., table_embeddings_v1">
+                                <small class="text-muted">Must be unique across all indexes</small>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Scope *</label>
+                                <select class="form-select" id="indexScope" required onchange="updateScopeDescription()">
+                                    <option value="">Select scope...</option>
+                                    <option value="table">Table-level (table names + descriptions)</option>
+                                    <option value="column">Column-level (column names + metadata)</option>
+                                    <option value="dictionary">Dictionary (terms + definitions)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="alert alert-info" id="scopeDescription" style="display: none;">
+                            <!-- Will be populated based on scope selection -->
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Backend *</label>
+                                <select class="form-select" id="indexBackend" required onchange="updateBackendInfo()">
+                                    <option value="">Select backend...</option>
+                                    <option value="faiss">FAISS (Fast similarity search)</option>
+                                    <option value="tfidf">TF-IDF (Traditional text search)</option>
+                                    <option value="pgvector">pgvector (PostgreSQL extension)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Embedding Model</label>
+                                <select class="form-select" id="embeddingModel">
+                                    <option value="sentence-transformers/all-MiniLM-L6-v2">all-MiniLM-L6-v2 (Fast, 384 dim)</option>
+                                    <option value="sentence-transformers/all-mpnet-base-v2">all-mpnet-base-v2 (Better quality, 768 dim)</option>
+                                    <option value="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2">Multilingual MiniLM (384 dim)</option>
+                                    <option value="custom">Custom model...</option>
+                                </select>
+                                <input type="text" class="form-control mt-2" id="customModel" 
+                                       placeholder="Enter custom model name" style="display: none;">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="alert alert-warning" id="backendInfo" style="display: none;">
+                            <!-- Will be populated based on backend selection -->
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <h6>Advanced Options</h6>
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label class="form-label">Batch Size</label>
+                                    <input type="number" class="form-control" id="batchSize" value="32" min="1" max="512">
+                                    <small class="text-muted">Items processed per batch</small>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label class="form-label">Max Text Length</label>
+                                    <input type="number" class="form-control" id="maxLength" value="512" min="64" max="2048">
+                                    <small class="text-muted">Maximum text length for embeddings</small>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="overwriteExisting">
+                            <label class="form-check-label" for="overwriteExisting">
+                                Overwrite existing index with same name
+                            </label>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="createIndex()">
+                    <i class="fas fa-rocket me-1"></i>Create Index
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Index Details Modal -->
+<div class="modal fade" id="indexDetailsModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="indexDetailsTitle">Index Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="indexDetailsContent">
+                    <!-- Will be populated dynamically -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-primary" onclick="testIndexSearch()">
+                    <i class="fas fa-search me-1"></i>Test Search
+                </button>
+                <button type="button" class="btn btn-outline-warning" onclick="rebuildIndexFromDetails()">
+                    <i class="fas fa-redo me-1"></i>Rebuild
+                </button>
+                <button type="button" class="btn btn-outline-danger" onclick="deleteIndexFromDetails()">
+                    <i class="fas fa-trash me-1"></i>Delete
+                </button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Search Test Modal -->
+<div class="modal fade" id="searchTestModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Test Index Search</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="searchTestForm">
+                    <div class="mb-3">
+                        <label class="form-label">Search Query</label>
+                        <input type="text" class="form-control" id="searchQuery" 
+                               placeholder="Enter search terms to test similarity...">
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Top K Results</label>
+                                <input type="number" class="form-control" id="topK" value="10" min="1" max="50">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Similarity Threshold</label>
+                                <input type="number" class="form-control" id="threshold" value="0.5" min="0" max="1" step="0.1">
+                            </div>
+                        </div>
+                    </div>
+                    <button type="button" class="btn btn-primary" onclick="executeSearch()">
+                        <i class="fas fa-search me-1"></i>Search
+                    </button>
+                </form>
+                
+                <div id="searchResults" class="mt-4" style="display: none;">
+                    <h6>Search Results:</h6>
+                    <div id="searchResultsContent"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let allIndexes = [];
+let currentIndexId = null;
+let activeJobsInterval = null;
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadEmbeddingData();
+    setupPerformanceChart();
+    startActiveJobsMonitoring();
+});
+
+async function loadEmbeddingData() {
+    try {
+        await Promise.all([
+            loadIndexes(),
+            loadActiveJobs()
+        ]);
+        updateStatistics();
+    } catch (error) {
+        console.error('Error loading embedding data:', error);
+        showToast('Error loading embedding data', 'danger');
+    }
+}
+
+async function loadIndexes() {
+    try {
+        // Simulate API call - in real implementation this would call the API
+        const indexes = [
+            {
+                id: 1,
+                name: 'table_embeddings_v1',
+                scope: 'table',
+                backend: 'faiss',
+                model_name: 'sentence-transformers/all-MiniLM-L6-v2',
+                status: 'ready',
+                progress: 100,
+                item_count: 25,
+                dimensions: 384,
+                created_at: '2024-01-15T10:30:00Z',
+                updated_at: '2024-01-15T10:35:00Z'
+            },
+            {
+                id: 2,
+                name: 'column_embeddings_v1',
+                scope: 'column',
+                backend: 'faiss',
+                model_name: 'sentence-transformers/all-MiniLM-L6-v2',
+                status: 'building',
+                progress: 65.5,
+                item_count: 142,
+                dimensions: 384,
+                created_at: '2024-01-16T09:15:00Z',
+                updated_at: '2024-01-16T09:20:00Z'
+            },
+            {
+                id: 3,
+                name: 'dictionary_tfidf_v1',
+                scope: 'dictionary',
+                backend: 'tfidf',
+                model_name: null,
+                status: 'ready',
+                progress: 100,
+                item_count: 89,
+                dimensions: 1000,
+                created_at: '2024-01-14T14:20:00Z',
+                updated_at: '2024-01-14T14:22:00Z'
+            }
+        ];
+        
+        allIndexes = indexes;
+        displayIndexes(indexes);
+        
+    } catch (error) {
+        console.error('Error loading indexes:', error);
+        throw error;
+    }
+}
+
+function displayIndexes(indexes) {
+    const container = document.getElementById('indexesContainer');
+    
+    if (indexes.length === 0) {
+        container.innerHTML = `
+            <div class="text-center p-5">
+                <i class="fas fa-vector-square fa-4x text-muted mb-3"></i>
+                <h5>No Embedding Indexes</h5>
+                <p class="text-muted">Create your first index to enable semantic search</p>
+                <button class="btn btn-primary" onclick="showCreateIndexModal()">
+                    <i class="fas fa-plus me-2"></i>Create Index
+                </button>
+            </div>
+        `;
+        return;
+    }
+    
+    const tableHtml = `
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Scope</th>
+                        <th>Backend</th>
+                        <th>Status</th>
+                        <th>Progress</th>
+                        <th>Items</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${indexes.map(index => createIndexRow(index)).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+    
+    container.innerHTML = tableHtml;
+}
+
+function createIndexRow(index) {
+    const statusBadge = getStatusBadge(index.status);
+    const progressBar = createProgressBar(index.progress, index.status);
+    const backendIcon = getBackendIcon(index.backend);
+    
+    return `
+        <tr onclick="showIndexDetails(${index.id})" style="cursor: pointer;">
+            <td>
+                <div class="fw-bold">${index.name}</div>
+                ${index.model_name ? `<small class="text-muted">${index.model_name}</small>` : ''}
+            </td>
+            <td>
+                <span class="badge bg-light text-dark">${index.scope.toUpperCase()}</span>
+            </td>
+            <td>
+                <div class="d-flex align-items-center">
+                    <i class="${backendIcon} me-2"></i>
+                    ${index.backend.toUpperCase()}
+                </div>
+            </td>
+            <td>${statusBadge}</td>
+            <td style="width: 150px;">
+                ${progressBar}
+            </td>
+            <td>
+                <span class="badge bg-info">${index.item_count}</span>
+                ${index.dimensions ? `<br><small class="text-muted">${index.dimensions}D</small>` : ''}
+            </td>
+            <td>
+                <small>${new Date(index.created_at).toLocaleDateString()}</small>
+            </td>
+            <td>
+                <div class="btn-group btn-group-sm" onclick="event.stopPropagation();">
+                    ${index.status === 'ready' ? `
+                        <button class="btn btn-outline-primary" onclick="testSearch(${index.id})" title="Test Search">
+                            <i class="fas fa-search"></i>
+                        </button>
+                    ` : ''}
+                    <button class="btn btn-outline-warning" onclick="rebuildIndex(${index.id})" title="Rebuild">
+                        <i class="fas fa-redo"></i>
+                    </button>
+                    <button class="btn btn-outline-danger" onclick="deleteIndex(${index.id})" title="Delete">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </td>
+        </tr>
+    `;
+}
+
+function getStatusBadge(status) {
+    const badges = {
+        'ready': '<span class="status-badge status-success">Ready</span>',
+        'building': '<span class="status-badge status-warning">Building</span>',
+        'error': '<span class="status-badge status-error">Error</span>',
+        'pending': '<span class="status-badge status-info">Pending</span>'
+    };
+    return badges[status] || badges['pending'];
+}
+
+function createProgressBar(progress, status) {
+    if (status === 'ready') {
+        return '<span class="text-success small"><i class="fas fa-check-circle me-1"></i>Complete</span>';
+    }
+    
+    if (status === 'error') {
+        return '<span class="text-danger small"><i class="fas fa-exclamation-circle me-1"></i>Failed</span>';
+    }
+    
+    return `
+        <div class="progress progress-custom">
+            <div class="progress-bar" style="width: ${progress}%"></div>
+        </div>
+        <small class="text-muted">${progress}%</small>
+    `;
+}
+
+function getBackendIcon(backend) {
+    const icons = {
+        'faiss': 'fas fa-rocket',
+        'tfidf': 'fas fa-calculator',
+        'pgvector': 'fas fa-database'
+    };
+    return icons[backend] || 'fas fa-cog';
+}
+
+async function loadActiveJobs() {
+    try {
+        const container = document.getElementById('activeJobsList');
+        
+        // Simulate active jobs
+        const activeJobs = allIndexes.filter(index => index.status === 'building').map(index => ({
+            job_id: `job_${index.id}`,
+            index_name: index.name,
+            status: 'building',
+            progress: index.progress,
+            message: `Processing ${index.scope} embeddings...`,
+            started_at: index.created_at
+        }));
+        
+        if (activeJobs.length === 0) {
+            container.innerHTML = '<div class="text-center text-muted p-3">No active jobs</div>';
+            return;
+        }
+        
+        container.innerHTML = activeJobs.map(job => `
+            <div class="border-bottom p-3">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <div class="fw-bold">${job.index_name}</div>
+                    <small class="text-muted">${job.progress}%</small>
+                </div>
+                <div class="progress progress-custom mb-2">
+                    <div class="progress-bar" style="width: ${job.progress}%"></div>
+                </div>
+                <div class="d-flex justify-content-between">
+                    <small class="text-muted">${job.message}</small>
+                    <small class="text-muted">Started ${new Date(job.started_at).toLocaleTimeString()}</small>
+                </div>
+            </div>
+        `).join('');
+        
+    } catch (error) {
+        console.error('Error loading active jobs:', error);
+    }
+}
+
+function updateStatistics() {
+    const total = allIndexes.length;
+    const ready = allIndexes.filter(i => i.status === 'ready').length;
+    const building = allIndexes.filter(i => i.status === 'building').length;
+    const totalItems = allIndexes.reduce((sum, i) => sum + (i.item_count || 0), 0);
+    
+    document.getElementById('totalIndexes').textContent = total;
+    document.getElementById('readyIndexes').textContent = ready;
+    document.getElementById('buildingIndexes').textContent = building;
+    document.getElementById('totalItems').textContent = totalItems.toLocaleString();
+}
+
+function filterIndexes() {
+    const scopeFilter = document.getElementById('scopeFilter').value;
+    const statusFilter = document.getElementById('statusFilter').value;
+    
+    const filteredIndexes = allIndexes.filter(index => {
+        const matchesScope = !scopeFilter || index.scope === scopeFilter;
+        const matchesStatus = !statusFilter || index.status === statusFilter;
+        return matchesScope && matchesStatus;
+    });
+    
+    displayIndexes(filteredIndexes);
+}
+
+function setupPerformanceChart() {
+    const ctx = document.getElementById('indexPerformanceChart').getContext('2d');
+    
+    // Sample performance data
+    const data = {
+        labels: ['Table Index', 'Column Index', 'Dictionary Index'],
+        datasets: [{
+            label: 'Search Time (ms)',
+            data: [15, 32, 8],
+            backgroundColor: ['rgba(37, 99, 235, 0.8)', 'rgba(16, 185, 129, 0.8)', 'rgba(245, 158, 11, 0.8)'],
+            borderColor: ['rgb(37, 99, 235)', 'rgb(16, 185, 129)', 'rgb(245, 158, 11)'],
+            borderWidth: 1
+        }]
+    };
+    
+    new Chart(ctx, {
+        type: 'bar',
+        data: data,
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    title: {
+                        display: true,
+                        text: 'Response Time (ms)'
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    display: false
+                }
+            }
+        }
+    });
+}
+
+function startActiveJobsMonitoring() {
+    // Refresh active jobs every 5 seconds
+    activeJobsInterval = setInterval(async () => {
+        await loadActiveJobs();
+        
+        // Simulate progress updates
+        allIndexes.forEach(index => {
+            if (index.status === 'building' && index.progress < 100) {
+                index.progress = Math.min(100, index.progress + Math.random() * 5);
+                if (index.progress >= 100) {
+                    index.status = 'ready';
+                }
+            }
+        });
+        
+        updateStatistics();
+        displayIndexes(allIndexes);
+    }, 5000);
+}
+
+function showCreateIndexModal() {
+    document.getElementById('createIndexForm').reset();
+    document.getElementById('scopeDescription').style.display = 'none';
+    document.getElementById('backendInfo').style.display = 'none';
+    document.getElementById('customModel').style.display = 'none';
+    
+    const modal = new bootstrap.Modal(document.getElementById('createIndexModal'));
+    modal.show();
+}
+
+function updateScopeDescription() {
+    const scope = document.getElementById('indexScope').value;
+    const descriptionDiv = document.getElementById('scopeDescription');
+    
+    const descriptions = {
+        'table': 'Creates embeddings for table names and descriptions. Useful for finding relevant tables based on business concepts.',
+        'column': 'Creates embeddings for column names, data types, and metadata. Helps identify relevant columns for queries.',
+        'dictionary': 'Creates embeddings for dictionary terms and definitions. Enables semantic search of business terminology.'
+    };
+    
+    if (scope && descriptions[scope]) {
+        descriptionDiv.innerHTML = `<i class="fas fa-info-circle me-2"></i>${descriptions[scope]}`;
+        descriptionDiv.style.display = 'block';
+    } else {
+        descriptionDiv.style.display = 'none';
+    }
+}
+
+function updateBackendInfo() {
+    const backend = document.getElementById('indexBackend').value;
+    const infoDiv = document.getElementById('backendInfo');
+    
+    const backendInfo = {
+        'faiss': 'FAISS provides fast similarity search using dense vector embeddings. Best for semantic similarity.',
+        'tfidf': 'TF-IDF uses traditional text search methods. Good for exact keyword matching.',
+        'pgvector': 'pgvector stores embeddings in PostgreSQL. Requires pgvector extension to be installed.'
+    };
+    
+    if (backend && backendInfo[backend]) {
+        infoDiv.innerHTML = `<i class="fas fa-lightbulb me-2"></i>${backendInfo[backend]}`;
+        infoDiv.style.display = 'block';
+    } else {
+        infoDiv.style.display = 'none';
+    }
+}
+
+// Handle custom model input
+document.getElementById('embeddingModel').addEventListener('change', function() {
+    const customModelInput = document.getElementById('customModel');
+    if (this.value === 'custom') {
+        customModelInput.style.display = 'block';
+        customModelInput.required = true;
+    } else {
+        customModelInput.style.display = 'none';
+        customModelInput.required = false;
+    }
+});
+
+async function createIndex() {
+    try {
+        const indexName = document.getElementById('indexName').value.trim();
+        const scope = document.getElementById('indexScope').value;
+        const backend = document.getElementById('indexBackend').value;
+        
+        if (!indexName || !scope || !backend) {
+            showToast('Please fill in all required fields', 'warning');
+            return;
+        }
+        
+        const model = document.getElementById('embeddingModel').value === 'custom' ?
+                     document.getElementById('customModel').value :
+                     document.getElementById('embeddingModel').value;
+        
+        const data = {
+            name: indexName,
+            scope: scope,
+            backend: backend,
+            model: model,
+            batch_size: parseInt(document.getElementById('batchSize').value),
+            max_length: parseInt(document.getElementById('maxLength').value),
+            overwrite: document.getElementById('overwriteExisting').checked
+        };
+        
+        const result = await apiRequest('/api/embeddings/create', {
+            method: 'POST',
+            body: JSON.stringify(data)
+        });
+        
+        showToast('Index creation started successfully', 'success');
+        
+        // Close modal and refresh
+        bootstrap.Modal.getInstance(document.getElementById('createIndexModal')).hide();
+        loadEmbeddingData();
+        
+    } catch (error) {
+        console.error('Error creating index:', error);
+        showToast('Error creating index: ' + error.message, 'danger');
+    }
+}
+
+function showIndexDetails(indexId) {
+    const index = allIndexes.find(i => i.id === indexId);
+    if (!index) return;
+    
+    currentIndexId = indexId;
+    document.getElementById('indexDetailsTitle').textContent = index.name;
+    
+    const detailsHtml = `
+        <div class="row">
+            <div class="col-md-6">
+                <h6>Configuration</h6>
+                <ul class="list-unstyled">
+                    <li><strong>Scope:</strong> ${index.scope}</li>
+                    <li><strong>Backend:</strong> ${index.backend}</li>
+                    <li><strong>Model:</strong> ${index.model_name || 'N/A'}</li>
+                    <li><strong>Dimensions:</strong> ${index.dimensions || 'N/A'}</li>
+                    <li><strong>Status:</strong> ${getStatusBadge(index.status)}</li>
+                </ul>
+            </div>
+            <div class="col-md-6">
+                <h6>Statistics</h6>
+                <ul class="list-unstyled">
+                    <li><strong>Items:</strong> ${index.item_count}</li>
+                    <li><strong>Progress:</strong> ${index.progress}%</li>
+                    <li><strong>Created:</strong> ${new Date(index.created_at).toLocaleString()}</li>
+                    <li><strong>Updated:</strong> ${new Date(index.updated_at).toLocaleString()}</li>
+                </ul>
+            </div>
+        </div>
+        
+        ${index.status === 'error' ? `
+            <div class="alert alert-danger mt-3">
+                <h6>Error Details</h6>
+                <p>Index build failed. Please check the logs or try rebuilding.</p>
+            </div>
+        ` : ''}
+        
+        ${index.status === 'building' ? `
+            <div class="mt-3">
+                <h6>Build Progress</h6>
+                <div class="progress progress-custom mb-2">
+                    <div class="progress-bar" style="width: ${index.progress}%"></div>
+                </div>
+                <small class="text-muted">Building... ${index.progress}% complete</small>
+            </div>
+        ` : ''}
+    `;
+    
+    document.getElementById('indexDetailsContent').innerHTML = detailsHtml;
+    
+    const modal = new bootstrap.Modal(document.getElementById('indexDetailsModal'));
+    modal.show();
+}
+
+function testSearch(indexId) {
+    const index = allIndexes.find(i => i.id === indexId);
+    if (!index || index.status !== 'ready') {
+        showToast('Index is not ready for testing', 'warning');
+        return;
+    }
+    
+    currentIndexId = indexId;
+    document.getElementById('searchTestForm').reset();
+    document.getElementById('searchResults').style.display = 'none';
+    
+    const modal = new bootstrap.Modal(document.getElementById('searchTestModal'));
+    modal.show();
+}
+
+function testIndexSearch() {
+    testSearch(currentIndexId);
+}
+
+async function executeSearch() {
+    try {
+        const query = document.getElementById('searchQuery').value.trim();
+        if (!query) {
+            showToast('Please enter a search query', 'warning');
+            return;
+        }
+        
+        const topK = parseInt(document.getElementById('topK').value);
+        const threshold = parseFloat(document.getElementById('threshold').value);
+        
+        const index = allIndexes.find(i => i.id === currentIndexId);
+        
+        // Simulate search results
+        const results = [
+            { rank: 1, score: 0.95, metadata: { type: 'table', name: 'customers', description: 'Customer information table' } },
+            { rank: 2, score: 0.87, metadata: { type: 'column', name: 'customer_name', table: 'customers' } },
+            { rank: 3, score: 0.76, metadata: { type: 'table', name: 'orders', description: 'Order transactions' } }
+        ];
+        
+        const resultsHtml = `
+            <div class="table-responsive">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Rank</th>
+                            <th>Score</th>
+                            <th>Item</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${results.map(result => `
+                            <tr>
+                                <td>${result.rank}</td>
+                                <td>
+                                    <div class="confidence-bar">
+                                        <div class="confidence-fill" style="width: ${result.score * 100}%"></div>
+                                    </div>
+                                    ${result.score.toFixed(3)}
+                                </td>
+                                <td>
+                                    <span class="badge bg-light text-dark">${result.metadata.type}</span>
+                                    <strong>${result.metadata.name}</strong>
+                                </td>
+                                <td>
+                                    ${result.metadata.description || result.metadata.table || ''}
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
+        `;
+        
+        document.getElementById('searchResultsContent').innerHTML = resultsHtml;
+        document.getElementById('searchResults').style.display = 'block';
+        
+        showToast('Search completed successfully', 'success');
+        
+    } catch (error) {
+        console.error('Error executing search:', error);
+        showToast('Error executing search: ' + error.message, 'danger');
+    }
+}
+
+async function rebuildIndex(indexId) {
+    const index = allIndexes.find(i => i.id === indexId);
+    if (!index) return;
+    
+    if (confirm(`Are you sure you want to rebuild "${index.name}"? This will take some time.`)) {
+        try {
+            // Simulate rebuild
+            index.status = 'building';
+            index.progress = 0;
+            
+            showToast('Index rebuild started', 'success');
+            updateStatistics();
+            displayIndexes(allIndexes);
+            
+        } catch (error) {
+            console.error('Error rebuilding index:', error);
+            showToast('Error rebuilding index: ' + error.message, 'danger');
+        }
+    }
+}
+
+function rebuildIndexFromDetails() {
+    bootstrap.Modal.getInstance(document.getElementById('indexDetailsModal')).hide();
+    rebuildIndex(currentIndexId);
+}
+
+async function deleteIndex(indexId) {
+    const index = allIndexes.find(i => i.id === indexId);
+    if (!index) return;
+    
+    if (confirm(`Are you sure you want to delete "${index.name}"? This action cannot be undone.`)) {
+        try {
+            // Remove from array (simulate API call)
+            allIndexes = allIndexes.filter(i => i.id !== indexId);
+            
+            showToast('Index deleted successfully', 'success');
+            updateStatistics();
+            displayIndexes(allIndexes);
+            
+        } catch (error) {
+            console.error('Error deleting index:', error);
+            showToast('Error deleting index: ' + error.message, 'danger');
+        }
+    }
+}
+
+function deleteIndexFromDetails() {
+    bootstrap.Modal.getInstance(document.getElementById('indexDetailsModal')).hide();
+    deleteIndex(currentIndexId);
+}
+
+function refreshIndexes() {
+    loadEmbeddingData();
+}
+
+function refreshActiveJobs() {
+    loadActiveJobs();
+}
+
+async function cleanupJobs() {
+    if (confirm('This will clean up completed and failed jobs. Continue?')) {
+        try {
+            showToast('Cleanup completed', 'success');
+            loadActiveJobs();
+        } catch (error) {
+            console.error('Error cleaning up jobs:', error);
+            showToast('Error cleaning up jobs: ' + error.message, 'danger');
+        }
+    }
+}
+
+// Cleanup interval when page unloads
+window.addEventListener('beforeunload', function() {
+    if (activeJobsInterval) {
+        clearInterval(activeJobsInterval);
+    }
+});
+</script>
+{% endblock %}

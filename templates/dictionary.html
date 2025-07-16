@@ -1,0 +1,859 @@
+<!-- templates/dictionary.html -->
+{% extends "base.html" %}
+
+{% block title %}Data Dictionary - RAG Data Platform{% endblock %}
+
+{% block page_title %}Data Dictionary & Encyclopedia{% endblock %}
+
+{% block header_actions %}
+<div class="btn-group">
+    <button class="btn btn-primary" onclick="showAddEntryModal()">
+        <i class="fas fa-plus me-2"></i>Add Entry
+    </button>
+    <button class="btn btn-outline-success" onclick="generateDictionary()">
+        <i class="fas fa-magic me-2"></i>Auto-Generate
+    </button>
+    <div class="btn-group">
+        <button class="btn btn-outline-secondary dropdown-toggle" data-bs-toggle="dropdown">
+            <i class="fas fa-download me-2"></i>Export
+        </button>
+        <ul class="dropdown-menu">
+            <li><a class="dropdown-item" href="#" onclick="exportDictionary('json')">Export as JSON</a></li>
+            <li><a class="dropdown-item" href="#" onclick="exportDictionary('csv')">Export as CSV</a></li>
+        </ul>
+    </div>
+    <button class="btn btn-outline-info" onclick="showImportModal()">
+        <i class="fas fa-upload me-2"></i>Import
+    </button>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="row mb-4">
+    <!-- Statistics Cards -->
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card">
+            <div class="metric-value" id="totalTerms">-</div>
+            <div class="metric-label">Total Terms</div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+            <div class="metric-value" id="approvedTerms">-</div>
+            <div class="metric-label">Approved Terms</div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card" style="background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);">
+            <div class="metric-value" id="pendingTerms">-</div>
+            <div class="metric-label">Pending Approval</div>
+        </div>
+    </div>
+    <div class="col-md-3 mb-3">
+        <div class="card metric-card" style="background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);">
+            <div class="metric-value" id="totalCategories">-</div>
+            <div class="metric-label">Categories</div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <!-- Categories Overview -->
+    <div class="col-md-4 mb-3">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="mb-0">
+                    <i class="fas fa-tags me-2"></i>
+                    Categories
+                </h6>
+            </div>
+            <div class="card-body p-0">
+                <div id="categoriesList" style="max-height: 300px; overflow-y: auto;">
+                    <div class="text-center p-3">
+                        <div class="loading-spinner me-2"></div>
+                        Loading categories...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Recent Additions -->
+    <div class="col-md-4 mb-3">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="mb-0">
+                    <i class="fas fa-clock me-2"></i>
+                    Recent Additions
+                </h6>
+            </div>
+            <div class="card-body p-0">
+                <div id="recentEntries" style="max-height: 300px; overflow-y: auto;">
+                    <div class="text-center p-3">
+                        <div class="loading-spinner me-2"></div>
+                        Loading recent entries...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Approval Queue -->
+    <div class="col-md-4 mb-3">
+        <div class="card">
+            <div class="card-header">
+                <h6 class="mb-0">
+                    <i class="fas fa-hourglass-half me-2"></i>
+                    Pending Approval
+                </h6>
+            </div>
+            <div class="card-body p-0">
+                <div id="pendingEntries" style="max-height: 300px; overflow-y: auto;">
+                    <div class="text-center p-3">
+                        <div class="loading-spinner me-2"></div>
+                        Loading pending entries...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">
+                    <i class="fas fa-book me-2"></i>
+                    Dictionary Entries
+                </h5>
+                <div class="d-flex gap-2">
+                    <input type="text" class="form-control form-control-sm" id="searchInput" 
+                           placeholder="Search terms..." style="width: 200px;" 
+                           onkeyup="filterEntries()">
+                    <select class="form-select form-select-sm" id="categoryFilter" 
+                            onchange="filterEntries()" style="width: auto;">
+                        <option value="">All Categories</option>
+                    </select>
+                    <select class="form-select form-select-sm" id="statusFilter" 
+                            onchange="filterEntries()" style="width: auto;">
+                        <option value="">All Status</option>
+                        <option value="approved">Approved</option>
+                        <option value="pending">Pending</option>
+                    </select>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div id="dictionaryEntriesContainer">
+                    <div class="text-center p-4">
+                        <div class="loading-spinner me-2"></div>
+                        Loading dictionary entries...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Add/Edit Entry Modal -->
+<div class="modal fade" id="entryModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="entryModalTitle">Add Dictionary Entry</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="entryForm">
+                    <input type="hidden" id="editEntryId">
+                    
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Term *</label>
+                                <input type="text" class="form-control" id="entryTerm" required>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Category</label>
+                                <select class="form-select" id="entryCategory">
+                                    <option value="general">General</option>
+                                    <option value="business_term">Business Term</option>
+                                    <option value="technical">Technical</option>
+                                    <option value="financial">Financial</option>
+                                    <option value="table">Table</option>
+                                    <option value="column">Column</option>
+                                    <option value="attribute">Attribute</option>
+                                    <option value="enumerated_value">Enumerated Value</option>
+                                    <option value="abbreviation">Abbreviation</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label class="form-label">Definition *</label>
+                        <textarea class="form-control" id="entryDefinition" rows="3" required 
+                                 placeholder="Provide a clear, business-friendly definition..."></textarea>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Synonyms</label>
+                                <input type="text" class="form-control" id="entrySynonyms" 
+                                       placeholder="synonym1, synonym2, synonym3">
+                                <small class="text-muted">Comma-separated alternative terms</small>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Abbreviations</label>
+                                <input type="text" class="form-control" id="entryAbbreviations" 
+                                       placeholder="abbr1, abbr2, abbr3">
+                                <small class="text-muted">Comma-separated abbreviations</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Source Table (if applicable)</label>
+                                <input type="text" class="form-control" id="entrySourceTable">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Source Column (if applicable)</label>
+                                <input type="text" class="form-control" id="entrySourceColumn">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="entryApproved">
+                            <label class="form-check-label" for="entryApproved">
+                                Approved for use
+                            </label>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="saveEntry()">
+                    <span id="saveButtonText">Add Entry</span>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Import Modal -->
+<div class="modal fade" id="importModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Import Dictionary</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <form id="importForm">
+                    <div class="mb-3">
+                        <label class="form-label">Import File</label>
+                        <div class="file-upload-area" id="importUploadArea">
+                            <div class="text-center">
+                                <i class="fas fa-upload fa-3x text-muted mb-2"></i>
+                                <p class="mb-1">Click to upload or drag and drop</p>
+                                <small class="text-muted">JSON or CSV files only</small>
+                            </div>
+                            <input type="file" id="importFile" accept=".json,.csv" style="display: none;">
+                        </div>
+                        <div id="importFileInfo" class="mt-2" style="display: none;">
+                            <div class="alert alert-info d-flex align-items-center">
+                                <i class="fas fa-file me-2"></i>
+                                <div>
+                                    <strong id="importFileName"></strong><br>
+                                    <small id="importFileSize"></small>
+                                </div>
+                                <button type="button" class="btn btn-sm btn-outline-danger ms-auto" onclick="clearImportFile()">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="overwriteExisting">
+                            <label class="form-check-label" for="overwriteExisting">
+                                Overwrite existing entries
+                            </label>
+                            <small class="text-muted d-block">If unchecked, duplicate entries will be skipped</small>
+                        </div>
+                    </div>
+                </form>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="importDictionary()">Import</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Entry Details Modal -->
+<div class="modal fade" id="entryDetailsModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="entryDetailsTitle">Entry Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="entryDetailsContent">
+                    <!-- Will be populated dynamically -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-warning" onclick="editEntryFromDetails()">
+                    <i class="fas fa-edit me-1"></i>Edit
+                </button>
+                <button type="button" class="btn btn-outline-success" onclick="approveEntryFromDetails()">
+                    <i class="fas fa-check me-1"></i>Approve
+                </button>
+                <button type="button" class="btn btn-outline-danger" onclick="deleteEntryFromDetails()">
+                    <i class="fas fa-trash me-1"></i>Delete
+                </button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let allEntries = [];
+let currentEntryId = null;
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadDictionaryData();
+    setupImportFileUpload();
+});
+
+async function loadDictionaryData() {
+    try {
+        await Promise.all([
+            loadDictionaryEntries(),
+            loadCategories(),
+            loadRecentEntries(),
+            loadPendingEntries()
+        ]);
+        updateStatistics();
+    } catch (error) {
+        console.error('Error loading dictionary data:', error);
+        showToast('Error loading dictionary data', 'danger');
+    }
+}
+
+async function loadDictionaryEntries() {
+    try {
+        const entries = await apiRequest('/api/dictionary');
+        allEntries = entries;
+        displayEntries(entries);
+        populateCategoryFilter(entries);
+    } catch (error) {
+        console.error('Error loading dictionary entries:', error);
+        throw error;
+    }
+}
+
+function displayEntries(entries) {
+    const container = document.getElementById('dictionaryEntriesContainer');
+    
+    if (entries.length === 0) {
+        container.innerHTML = `
+            <div class="text-center p-5">
+                <i class="fas fa-book fa-4x text-muted mb-3"></i>
+                <h5>No Dictionary Entries</h5>
+                <p class="text-muted">Start building your data dictionary</p>
+                <button class="btn btn-primary me-2" onclick="showAddEntryModal()">
+                    <i class="fas fa-plus me-2"></i>Add Entry
+                </button>
+                <button class="btn btn-outline-success" onclick="generateDictionary()">
+                    <i class="fas fa-magic me-2"></i>Auto-Generate
+                </button>
+            </div>
+        `;
+        return;
+    }
+    
+    const tableHtml = `
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead>
+                    <tr>
+                        <th>Term</th>
+                        <th>Definition</th>
+                        <th>Category</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    ${entries.map(entry => createEntryRow(entry)).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+    
+    container.innerHTML = tableHtml;
+}
+
+function createEntryRow(entry) {
+    const statusBadge = entry.approved ? 
+        '<span class="status-badge status-success">Approved</span>' :
+        '<span class="status-badge status-warning">Pending</span>';
+    
+    const truncatedDefinition = entry.definition.length > 100 ?
+        entry.definition.substring(0, 100) + '...' : entry.definition;
+    
+    return `
+        <tr onclick="showEntryDetails(${entry.id})" style="cursor: pointer;">
+            <td>
+                <div class="fw-bold">${entry.term}</div>
+                ${entry.synonyms && entry.synonyms.length > 0 ? 
+                    `<small class="text-muted">Synonyms: ${entry.synonyms.slice(0, 3).join(', ')}</small>` : ''}
+            </td>
+            <td>
+                <div class="text-truncate" style="max-width: 300px;" title="${entry.definition}">
+                    ${truncatedDefinition}
+                </div>
+            </td>
+            <td>
+                <span class="badge bg-light text-dark">${entry.category}</span>
+            </td>
+            <td>${statusBadge}</td>
+            <td>
+                <small>${new Date(entry.created_at).toLocaleDateString()}</small>
+            </td>
+            <td>
+                <div class="btn-group btn-group-sm" onclick="event.stopPropagation();">
+                    <button class="btn btn-outline-primary" onclick="editEntry(${entry.id})" title="Edit">
+                        <i class="fas fa-edit"></i>
+                    </button>
+                    ${!entry.approved ? 
+                        `<button class="btn btn-outline-success" onclick="approveEntry(${entry.id})" title="Approve">
+                            <i class="fas fa-check"></i>
+                        </button>` : ''}
+                    <button class="btn btn-outline-danger" onclick="deleteEntry(${entry.id})" title="Delete">
+                        <i class="fas fa-trash"></i>
+                    </button>
+                </div>
+            </td>
+        </tr>
+    `;
+}
+
+async function loadCategories() {
+    try {
+        // This would normally call an API to get category statistics
+        const categories = [
+            { category: 'business_term', total_count: 45, approved_count: 38 },
+            { category: 'technical', total_count: 23, approved_count: 20 },
+            { category: 'financial', total_count: 18, approved_count: 16 },
+            { category: 'table', total_count: 12, approved_count: 12 },
+            { category: 'column', total_count: 67, approved_count: 54 }
+        ];
+        
+        const container = document.getElementById('categoriesList');
+        container.innerHTML = categories.map(cat => `
+            <div class="border-bottom p-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <div class="fw-bold">${cat.category.replace('_', ' ').toUpperCase()}</div>
+                        <small class="text-muted">${cat.approved_count}/${cat.total_count} approved</small>
+                    </div>
+                    <div class="progress-custom" style="width: 60px;">
+                        <div class="progress-bar" style="width: ${(cat.approved_count / cat.total_count) * 100}%"></div>
+                    </div>
+                </div>
+            </div>
+        `).join('');
+        
+    } catch (error) {
+        console.error('Error loading categories:', error);
+    }
+}
+
+async function loadRecentEntries() {
+    try {
+        const recent = allEntries.slice(-5).reverse();
+        const container = document.getElementById('recentEntries');
+        
+        if (recent.length === 0) {
+            container.innerHTML = '<div class="text-center text-muted p-3">No recent entries</div>';
+            return;
+        }
+        
+        container.innerHTML = recent.map(entry => `
+            <div class="border-bottom p-3">
+                <div class="fw-bold">${entry.term}</div>
+                <small class="text-muted">${entry.category} • ${new Date(entry.created_at).toLocaleDateString()}</small>
+            </div>
+        `).join('');
+        
+    } catch (error) {
+        console.error('Error loading recent entries:', error);
+    }
+}
+
+async function loadPendingEntries() {
+    try {
+        const pending = allEntries.filter(entry => !entry.approved);
+        const container = document.getElementById('pendingEntries');
+        
+        if (pending.length === 0) {
+            container.innerHTML = '<div class="text-center text-muted p-3">No pending entries</div>';
+            return;
+        }
+        
+        container.innerHTML = pending.slice(0, 5).map(entry => `
+            <div class="border-bottom p-3">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div>
+                        <div class="fw-bold">${entry.term}</div>
+                        <small class="text-muted">${entry.category}</small>
+                    </div>
+                    <button class="btn btn-sm btn-outline-success" onclick="approveEntry(${entry.id})">
+                        <i class="fas fa-check"></i>
+                    </button>
+                </div>
+            </div>
+        `).join('');
+        
+    } catch (error) {
+        console.error('Error loading pending entries:', error);
+    }
+}
+
+function updateStatistics() {
+    const total = allEntries.length;
+    const approved = allEntries.filter(e => e.approved).length;
+    const pending = total - approved;
+    const categories = new Set(allEntries.map(e => e.category)).size;
+    
+    document.getElementById('totalTerms').textContent = total;
+    document.getElementById('approvedTerms').textContent = approved;
+    document.getElementById('pendingTerms').textContent = pending;
+    document.getElementById('totalCategories').textContent = categories;
+}
+
+function populateCategoryFilter(entries) {
+    const categories = [...new Set(entries.map(e => e.category))].sort();
+    const categoryFilter = document.getElementById('categoryFilter');
+    
+    // Clear existing options except "All Categories"
+    categoryFilter.innerHTML = '<option value="">All Categories</option>';
+    
+    categories.forEach(category => {
+        const option = document.createElement('option');
+        option.value = category;
+        option.textContent = category.replace('_', ' ').toUpperCase();
+        categoryFilter.appendChild(option);
+    });
+}
+
+function filterEntries() {
+    const searchTerm = document.getElementById('searchInput').value.toLowerCase();
+    const categoryFilter = document.getElementById('categoryFilter').value;
+    const statusFilter = document.getElementById('statusFilter').value;
+    
+    const filteredEntries = allEntries.filter(entry => {
+        const matchesSearch = entry.term.toLowerCase().includes(searchTerm) ||
+                             entry.definition.toLowerCase().includes(searchTerm);
+        const matchesCategory = !categoryFilter || entry.category === categoryFilter;
+        const matchesStatus = !statusFilter || 
+                             (statusFilter === 'approved' && entry.approved) ||
+                             (statusFilter === 'pending' && !entry.approved);
+        
+        return matchesSearch && matchesCategory && matchesStatus;
+    });
+    
+    displayEntries(filteredEntries);
+}
+
+function showAddEntryModal() {
+    document.getElementById('entryModalTitle').textContent = 'Add Dictionary Entry';
+    document.getElementById('saveButtonText').textContent = 'Add Entry';
+    document.getElementById('entryForm').reset();
+    document.getElementById('editEntryId').value = '';
+    
+    const modal = new bootstrap.Modal(document.getElementById('entryModal'));
+    modal.show();
+}
+
+function editEntry(entryId) {
+    const entry = allEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    
+    document.getElementById('entryModalTitle').textContent = 'Edit Dictionary Entry';
+    document.getElementById('saveButtonText').textContent = 'Update Entry';
+    document.getElementById('editEntryId').value = entryId;
+    
+    // Populate form fields
+    document.getElementById('entryTerm').value = entry.term;
+    document.getElementById('entryCategory').value = entry.category;
+    document.getElementById('entryDefinition').value = entry.definition;
+    document.getElementById('entrySynonyms').value = (entry.synonyms || []).join(', ');
+    document.getElementById('entryAbbreviations').value = (entry.abbreviations || []).join(', ');
+    document.getElementById('entrySourceTable').value = entry.source_table || '';
+    document.getElementById('entrySourceColumn').value = entry.source_column || '';
+    document.getElementById('entryApproved').checked = entry.approved;
+    
+    const modal = new bootstrap.Modal(document.getElementById('entryModal'));
+    modal.show();
+}
+
+async function saveEntry() {
+    try {
+        const entryId = document.getElementById('editEntryId').value;
+        const term = document.getElementById('entryTerm').value.trim();
+        const definition = document.getElementById('entryDefinition').value.trim();
+        
+        if (!term || !definition) {
+            showToast('Term and definition are required', 'warning');
+            return;
+        }
+        
+        const data = {
+            term: term,
+            definition: definition,
+            category: document.getElementById('entryCategory').value,
+            synonyms: document.getElementById('entrySynonyms').value.split(',').map(s => s.trim()).filter(s => s),
+            abbreviations: document.getElementById('entryAbbreviations').value.split(',').map(s => s.trim()).filter(s => s),
+            source_table: document.getElementById('entrySourceTable').value.trim() || null,
+            source_column: document.getElementById('entrySourceColumn').value.trim() || null,
+            approved: document.getElementById('entryApproved').checked
+        };
+        
+        const method = entryId ? 'PUT' : 'POST';
+        const url = entryId ? `/api/dictionary/${entryId}` : '/api/dictionary';
+        
+        await apiRequest(url, {
+            method: method,
+            body: JSON.stringify(data)
+        });
+        
+        showToast(entryId ? 'Entry updated successfully' : 'Entry added successfully', 'success');
+        
+        // Close modal and refresh data
+        bootstrap.Modal.getInstance(document.getElementById('entryModal')).hide();
+        loadDictionaryData();
+        
+    } catch (error) {
+        console.error('Error saving entry:', error);
+        showToast('Error saving entry: ' + error.message, 'danger');
+    }
+}
+
+async function approveEntry(entryId) {
+    try {
+        await apiRequest(`/api/dictionary/${entryId}`, {
+            method: 'PUT',
+            body: JSON.stringify({ approved: true })
+        });
+        
+        showToast('Entry approved successfully', 'success');
+        loadDictionaryData();
+        
+    } catch (error) {
+        console.error('Error approving entry:', error);
+        showToast('Error approving entry: ' + error.message, 'danger');
+    }
+}
+
+async function deleteEntry(entryId) {
+    const entry = allEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    
+    if (confirm(`Are you sure you want to delete "${entry.term}"? This action cannot be undone.`)) {
+        try {
+            await apiRequest(`/api/dictionary/${entryId}`, {
+                method: 'DELETE'
+            });
+            
+            showToast('Entry deleted successfully', 'success');
+            loadDictionaryData();
+            
+        } catch (error) {
+            console.error('Error deleting entry:', error);
+            showToast('Error deleting entry: ' + error.message, 'danger');
+        }
+    }
+}
+
+async function generateDictionary() {
+    if (confirm('This will auto-generate dictionary entries from your data sources. Continue?')) {
+        try {
+            showToast('Generating dictionary entries...', 'info');
+            
+            const result = await apiRequest('/api/dictionary/generate', {
+                method: 'POST'
+            });
+            
+            showToast(`Generated ${result.terms_generated} new dictionary entries`, 'success');
+            loadDictionaryData();
+            
+        } catch (error) {
+            console.error('Error generating dictionary:', error);
+            showToast('Error generating dictionary: ' + error.message, 'danger');
+        }
+    }
+}
+
+function showEntryDetails(entryId) {
+    const entry = allEntries.find(e => e.id === entryId);
+    if (!entry) return;
+    
+    currentEntryId = entryId;
+    
+    document.getElementById('entryDetailsTitle').textContent = entry.term;
+    
+    const detailsHtml = `
+        <div class="row">
+            <div class="col-md-8">
+                <h6>Definition</h6>
+                <p>${entry.definition}</p>
+                
+                ${entry.synonyms && entry.synonyms.length > 0 ? `
+                    <h6>Synonyms</h6>
+                    <div class="mb-3">
+                        ${entry.synonyms.map(syn => `<span class="entity-tag">${syn}</span>`).join('')}
+                    </div>
+                ` : ''}
+                
+                ${entry.abbreviations && entry.abbreviations.length > 0 ? `
+                    <h6>Abbreviations</h6>
+                    <div class="mb-3">
+                        ${entry.abbreviations.map(abbr => `<span class="entity-tag">${abbr}</span>`).join('')}
+                    </div>
+                ` : ''}
+            </div>
+            <div class="col-md-4">
+                <h6>Metadata</h6>
+                <ul class="list-unstyled">
+                    <li><strong>Category:</strong> ${entry.category}</li>
+                    <li><strong>Status:</strong> ${entry.approved ? 'Approved' : 'Pending'}</li>
+                    <li><strong>Version:</strong> ${entry.version || 1}</li>
+                    ${entry.source_table ? `<li><strong>Source Table:</strong> ${entry.source_table}</li>` : ''}
+                    ${entry.source_column ? `<li><strong>Source Column:</strong> ${entry.source_column}</li>` : ''}
+                    <li><strong>Created:</strong> ${new Date(entry.created_at).toLocaleDateString()}</li>
+                    <li><strong>Updated:</strong> ${new Date(entry.updated_at).toLocaleDateString()}</li>
+                </ul>
+            </div>
+        </div>
+    `;
+    
+    document.getElementById('entryDetailsContent').innerHTML = detailsHtml;
+    
+    const modal = new bootstrap.Modal(document.getElementById('entryDetailsModal'));
+    modal.show();
+}
+
+function editEntryFromDetails() {
+    bootstrap.Modal.getInstance(document.getElementById('entryDetailsModal')).hide();
+    editEntry(currentEntryId);
+}
+
+async function approveEntryFromDetails() {
+    await approveEntry(currentEntryId);
+    bootstrap.Modal.getInstance(document.getElementById('entryDetailsModal')).hide();
+}
+
+async function deleteEntryFromDetails() {
+    bootstrap.Modal.getInstance(document.getElementById('entryDetailsModal')).hide();
+    await deleteEntry(currentEntryId);
+}
+
+function setupImportFileUpload() {
+    const uploadArea = document.getElementById('importUploadArea');
+    const fileInput = document.getElementById('importFile');
+    
+    setupFileUpload(uploadArea, fileInput, handleImportFileSelect);
+}
+
+function handleImportFileSelect(file) {
+    const allowedTypes = ['.json', '.csv'];
+    const fileExtension = '.' + file.name.split('.').pop().toLowerCase();
+    
+    if (!allowedTypes.includes(fileExtension)) {
+        showToast('Invalid file type. Please select a JSON or CSV file.', 'danger');
+        return;
+    }
+    
+    document.getElementById('importFileName').textContent = file.name;
+    document.getElementById('importFileSize').textContent = formatBytes(file.size);
+    document.getElementById('importFileInfo').style.display = 'block';
+}
+
+function clearImportFile() {
+    document.getElementById('importFile').value = '';
+    document.getElementById('importFileInfo').style.display = 'none';
+}
+
+function showImportModal() {
+    document.getElementById('importForm').reset();
+    document.getElementById('importFileInfo').style.display = 'none';
+    
+    const modal = new bootstrap.Modal(document.getElementById('importModal'));
+    modal.show();
+}
+
+async function importDictionary() {
+    try {
+        const file = document.getElementById('importFile').files[0];
+        if (!file) {
+            showToast('Please select a file to import', 'warning');
+            return;
+        }
+        
+        const overwrite = document.getElementById('overwriteExisting').checked;
+        
+        // In a real implementation, you'd use FormData to upload the file
+        showToast('Import functionality not fully implemented - would upload and process file', 'info');
+        
+        bootstrap.Modal.getInstance(document.getElementById('importModal')).hide();
+        
+    } catch (error) {
+        console.error('Error importing dictionary:', error);
+        showToast('Error importing dictionary: ' + error.message, 'danger');
+    }
+}
+
+async function exportDictionary(format) {
+    try {
+        const url = `/api/export/dictionary?format=${format}`;
+        
+        // Trigger download
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `dictionary.${format}`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        
+        showToast(`Dictionary exported as ${format.toUpperCase()}`, 'success');
+        
+    } catch (error) {
+        console.error('Error exporting dictionary:', error);
+        showToast('Error exporting dictionary: ' + error.message, 'danger');
+    }
+}
+</script>
+{% endblock %}

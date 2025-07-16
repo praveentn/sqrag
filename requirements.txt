@@ -1,0 +1,93 @@
+# requirements.txt
+# Core Flask dependencies
+Flask>=3.0.0
+Flask-SQLAlchemy>=3.1.1
+Flask-Migrate>=4.0.5
+
+# Database drivers
+psycopg2-binary>=2.9.9  # PostgreSQL
+PyMySQL>=1.1.0          # MySQL
+# cx-Oracle>=8.3.0        # Oracle (optional)
+
+# Data processing
+pandas>=2.1.4
+numpy>=1.24.4
+openpyxl>=3.1.2         # Excel support
+xlrd>=2.0.1             # Legacy Excel support
+
+# SQL parsing and validation
+sqlparse>=0.4.4
+SQLAlchemy>=2.0.23
+
+# LLM clients
+openai>=1.6.1           # OpenAI and Azure OpenAI
+# anthropic>=0.8.1        # Anthropic Claude (optional)
+
+# Embedding and similarity search
+sentence-transformers>=2.2.2
+scikit-learn>=1.3.2
+faiss-cpu>=1.7.4        # FAISS for similarity search
+transformers>=4.36.2
+
+# Text processing
+# difflib                 # Built-in for fuzzy matching
+# re                      # Built-in for regex
+
+# Web scraping and HTTP (if needed)
+# requests>=2.31.0
+# urllib3>=2.1.0
+
+# Configuration and environment
+# python-dotenv>=1.0.0
+PyYAML>=6.0.1
+
+# Logging and monitoring
+python-json-logger>=2.0.7
+
+# File handling
+# pathlib                 # Built-in
+# tempfile               # Built-in
+# uuid                   # Built-in
+
+# Date and time
+# python-dateutil>=2.8.2
+
+# Development and testing
+# pytest>=7.4.3
+# pytest-flask>=1.3.0
+# pytest-cov>=4.1.0
+# black>=23.11.0          # Code formatting
+# flake8>=6.1.0           # Linting
+# isort>=5.12.0           # Import sorting
+
+# Production server
+gunicorn>=21.2.0
+waitress>=2.1.2         # Alternative WSGI server for Windows
+
+# Optional: Enhanced database support
+alembic>=1.13.1         # Database migrations (included with Flask-Migrate)
+
+# Optional: Caching
+redis>=5.0.1            # Redis client (if using Redis for caching)
+Flask-Caching>=2.1.0
+
+# Optional: Enhanced security
+# cryptography>=41.0.8
+# bcrypt>=4.1.2
+
+# Optional: API documentation
+flask-restx>=1.3.0      # API documentation (if needed)
+
+# Optional: Background tasks
+celery>=5.3.4           # Task queue (if needed for async processing)
+
+# Optional: Monitoring and profiling
+flask-profiler>=1.8.1  # Performance profiling
+prometheus-client>=0.19.0  # Metrics collection
+
+# Windows-specific (if running on Windows)
+pywin32>=306; sys_platform >= "win32"
+
+# Development utilities
+ipython>=8.18.1         # Enhanced REPL
+jupyter>=1.0.0          # Jupyter notebooks for analysis
