@@ -34,7 +34,9 @@ class RAGPipeline:
             
             # Create or get chat session
             if session_id:
-                session = ChatSession.query.get_or_404(session_id)
+                session = ChatSession.query.get(session_id)
+                if not session:
+                    raise ValueError(f"Session {session_id} not found")
             else:
                 session = ChatSession(
                     title=self._generate_session_title(query),
@@ -49,7 +51,7 @@ class RAGPipeline:
                 session_id=session_id,
                 role='user',
                 content=query,
-                _metadata={'correlation_id': correlation_id},
+                metadata={'correlation_id': correlation_id},
                 created_at=datetime.utcnow()
             )
             db.session.add(user_message)
@@ -59,36 +61,47 @@ class RAGPipeline:
             context = self._get_conversation_context(session_id)
             
             # Step 1: Entity Extraction
+            logger.info(f"[{correlation_id}] Step 1: Extracting entities")
             entities = self._extract_entities(query, context)
+            logger.info(f"[{correlation_id}] Found {len(entities)} entities")
             
             # Step 2: Rank candidate tables and schemas
+            logger.info(f"[{correlation_id}] Step 2: Ranking candidate tables")
             candidate_tables = self._rank_candidate_tables(entities, query)
+            logger.info(f"[{correlation_id}] Found {len(candidate_tables)} candidate tables")
             
             # Step 3: Generate SQL
+            logger.info(f"[{correlation_id}] Step 3: Generating SQL")
             sql_result = self._generate_sql(query, entities, candidate_tables, context)
+            logger.info(f"[{correlation_id}] SQL generated with confidence: {sql_result.get('confidence', 0)}")
             
             # Step 4: Execute SQL if confidence is high enough
             execution_result = None
-            if sql_result['confidence'] >= self.rag_config['confidence_threshold']:
+            if sql_result.get('sql') and sql_result['confidence'] >= self.rag_config['confidence_threshold']:
+                logger.info(f"[{correlation_id}] Step 4: Executing SQL")
                 execution_result = self._execute_sql_safely(
                     sql_result['sql'], 
                     candidate_tables[0]['source_id'] if candidate_tables else None,
                     session_id,
                     user_message.id
                 )
+            else:
+                logger.info(f"[{correlation_id}] Skipping SQL execution - low confidence or no SQL")
             
             # Create assistant response
-            response_content = self._format_response(sql_result, execution_result)
+            response_content = self._format_response(sql_result, execution_result, entities, candidate_tables)
             assistant_message = ChatMessage(
                 session_id=session_id,
                 role='assistant',
                 content=response_content,
-                _metadata={
+                metadata={
                     'correlation_id': correlation_id,
                     'entities': entities,
                     'candidate_tables': candidate_tables,
                     'sql_result': sql_result,
-                    'execution_result': execution_result
+                    'execution_result': execution_result,
+                    'sql': sql_result.get('sql', ''),
+                    'confidence': sql_result.get('confidence', 0)
                 },
                 created_at=datetime.utcnow()
             )
@@ -103,8 +116,8 @@ class RAGPipeline:
                 'session_id': session_id,
                 'message_id': assistant_message.id,
                 'response': response_content,
-                'sql': sql_result['sql'],
-                'confidence': sql_result['confidence'],
+                'sql': sql_result.get('sql', ''),
+                'confidence': sql_result.get('confidence', 0),
                 'entities': entities,
                 'candidate_tables': [t['name'] for t in candidate_tables],
                 'execution_result': execution_result,
@@ -113,7 +126,23 @@ class RAGPipeline:
             
         except Exception as e:
             db.session.rollback()
-            logger.error(f"Error processing query: {str(e)}")
+            logger.error(f"Error processing query [{correlation_id}]: {str(e)}")
+            
+            # Create error response
+            try:
+                if session_id:
+                    error_message = ChatMessage(
+                        session_id=session_id,
+                        role='assistant',
+                        content=f"I encountered an error while processing your query: {str(e)}",
+                        metadata={'error': str(e), 'correlation_id': correlation_id},
+                        created_at=datetime.utcnow()
+                    )
+                    db.session.add(error_message)
+                    db.session.commit()
+            except:
+                pass
+            
             raise
     
     def process_feedback(self, feedback: str, session_id: int, message_id: int = None) -> Dict[str, Any]:
@@ -123,7 +152,10 @@ class RAGPipeline:
             logger.info(f"Processing feedback [{correlation_id}]: {feedback[:100]}...")
             
             # Get session and context
-            session = ChatSession.query.get_or_404(session_id)
+            session = ChatSession.query.get(session_id)
+            if not session:
+                raise ValueError(f"Session {session_id} not found")
+                
             context = self._get_conversation_context(session_id, include_current=True)
             
             # Get the last assistant message if message_id not provided
@@ -137,14 +169,14 @@ class RAGPipeline:
             
             # Get original query context
             original_message = ChatMessage.query.get(message_id) if message_id else None
-            original__metadata = original_message._metadata if original_message else {}
+            original_metadata = original_message.metadata if original_message else {}
             
             # Add feedback message
             feedback_message = ChatMessage(
                 session_id=session_id,
                 role='user',
                 content=feedback,
-                _metadata={
+                metadata={
                     'correlation_id': correlation_id,
                     'feedback_for': message_id,
                     'type': 'feedback'
@@ -166,8 +198,8 @@ class RAGPipeline:
             sql_result = self._refine_sql_with_feedback(
                 original_query, 
                 feedback, 
-                original__metadata.get('sql_result', {}),
-                original__metadata.get('execution_result'),
+                original_metadata.get('sql_result', {}),
+                original_metadata.get('execution_result'),
                 entities,
                 candidate_tables,
                 context
@@ -175,7 +207,7 @@ class RAGPipeline:
             
             # Execute refined SQL
             execution_result = None
-            if sql_result['confidence'] >= self.rag_config['confidence_threshold']:
+            if sql_result.get('sql') and sql_result['confidence'] >= self.rag_config['confidence_threshold']:
                 execution_result = self._execute_sql_safely(
                     sql_result['sql'],
                     candidate_tables[0]['source_id'] if candidate_tables else None,
@@ -189,14 +221,16 @@ class RAGPipeline:
                 session_id=session_id,
                 role='assistant',
                 content=response_content,
-                _metadata={
+                metadata={
                     'correlation_id': correlation_id,
                     'entities': entities,
                     'candidate_tables': candidate_tables,
                     'sql_result': sql_result,
                     'execution_result': execution_result,
                     'refined_from': message_id,
-                    'feedback': feedback
+                    'feedback': feedback,
+                    'sql': sql_result.get('sql', ''),
+                    'confidence': sql_result.get('confidence', 0)
                 },
                 parent_message_id=feedback_message.id,
                 created_at=datetime.utcnow()
@@ -212,8 +246,8 @@ class RAGPipeline:
                 'session_id': session_id,
                 'message_id': refined_message.id,
                 'response': response_content,
-                'sql': sql_result['sql'],
-                'confidence': sql_result['confidence'],
+                'sql': sql_result.get('sql', ''),
+                'confidence': sql_result.get('confidence', 0),
                 'entities': entities,
                 'candidate_tables': [t['name'] for t in candidate_tables],
                 'execution_result': execution_result,
@@ -223,7 +257,7 @@ class RAGPipeline:
             
         except Exception as e:
             db.session.rollback()
-            logger.error(f"Error processing feedback: {str(e)}")
+            logger.error(f"Error processing feedback [{correlation_id}]: {str(e)}")
             raise
     
     def _extract_entities(self, query: str, context: List[Dict] = None) -> List[Dict[str, Any]]:
@@ -233,6 +267,8 @@ class RAGPipeline:
             tables = self._get_available_tables()
             columns = self._get_available_columns()
             dictionary_terms = self._get_dictionary_terms()
+            
+            logger.info(f"Available tables: {len(tables)}, columns: {len(columns)}, terms: {len(dictionary_terms)}")
             
             # Use LLM for entity extraction
             llm_entities = self._llm_extract_entities(query, tables, columns, dictionary_terms, context)
@@ -294,7 +330,15 @@ class RAGPipeline:
             try:
                 entities = json.loads(response)
                 if isinstance(entities, list):
-                    return entities
+                    # Validate entity format
+                    validated_entities = []
+                    for entity in entities:
+                        if isinstance(entity, dict) and 'entity' in entity:
+                            entity.setdefault('type', 'unknown')
+                            entity.setdefault('confidence', 0.5)
+                            entity['method'] = 'llm'
+                            validated_entities.append(entity)
+                    return validated_entities
             except json.JSONDecodeError:
                 logger.warning("LLM response not valid JSON, falling back to regex extraction")
             
@@ -319,7 +363,7 @@ class RAGPipeline:
                 entities.append({
                     'entity': table,
                     'type': 'table',
-                    'confidence': ratio,
+                    'confidence': round(ratio, 3),
                     'method': 'similarity'
                 })
         
@@ -330,7 +374,7 @@ class RAGPipeline:
                 entities.append({
                     'entity': column,
                     'type': 'column',
-                    'confidence': ratio,
+                    'confidence': round(ratio, 3),
                     'method': 'similarity'
                 })
         
@@ -341,7 +385,7 @@ class RAGPipeline:
                 entities.append({
                     'entity': term,
                     'type': 'term',
-                    'confidence': ratio,
+                    'confidence': round(ratio, 3),
                     'method': 'similarity'
                 })
         
@@ -364,7 +408,7 @@ class RAGPipeline:
                     entities.append({
                         'entity': match[0],
                         'type': match[1],
-                        'confidence': float(match[2]),
+                        'confidence': round(float(match[2]), 3),
                         'method': 'regex'
                     })
                 except (ValueError, IndexError):
@@ -376,7 +420,6 @@ class RAGPipeline:
                                   similarity_entities: List[Dict]) -> List[Dict[str, Any]]:
         """Combine entities from different methods and rank them"""
         entity_map = {}
-        weights = self.entity_config['ranking_weights']
         
         # Process LLM entities
         for entity in llm_entities:
@@ -412,7 +455,7 @@ class RAGPipeline:
         try:
             table_scores = {}
             
-            # Get all tables with their _metadata
+            # Get all tables with their metadata
             tables = Table.query.all()
             
             for table in tables:
@@ -466,6 +509,16 @@ class RAGPipeline:
                      context: List[Dict] = None) -> Dict[str, Any]:
         """Generate SQL query using LLM"""
         try:
+            if not candidate_tables:
+                return {
+                    'sql': '',
+                    'rationale': 'No relevant tables found for the query',
+                    'confidence': 0.0,
+                    'tables_used': [],
+                    'assumptions': [],
+                    'error': 'No candidate tables available'
+                }
+            
             # Prepare schemas for top candidate tables
             schemas = self._format_schemas_for_llm(candidate_tables)
             
@@ -488,11 +541,14 @@ class RAGPipeline:
                 if 'sql' not in sql_result:
                     raise ValueError("No SQL in response")
                 
-                # Set defaults
+                # Set defaults and ensure proper formatting
                 sql_result.setdefault('confidence', 0.5)
                 sql_result.setdefault('rationale', 'Generated SQL query')
                 sql_result.setdefault('tables_used', [])
                 sql_result.setdefault('assumptions', [])
+                
+                # Round confidence to 3 decimal places
+                sql_result['confidence'] = round(sql_result['confidence'], 3)
                 
                 return sql_result
                 
@@ -545,6 +601,7 @@ class RAGPipeline:
                 refined_result = json.loads(response)
                 refined_result.setdefault('confidence', 0.7)
                 refined_result.setdefault('changes', [])
+                refined_result['confidence'] = round(refined_result['confidence'], 3)
                 return refined_result
                 
             except json.JSONDecodeError:
@@ -594,7 +651,7 @@ class RAGPipeline:
                 context.append({
                     'role': msg.role,
                     'content': msg.content,
-                    '_metadata': msg._metadata or {},
+                    'metadata': msg.metadata or {},
                     'created_at': msg.created_at.isoformat()
                 })
             
@@ -607,7 +664,7 @@ class RAGPipeline:
     def _get_original_query_from_context(self, context: List[Dict]) -> str:
         """Extract the original user query from context"""
         for msg in reversed(context):
-            if msg['role'] == 'user' and msg['_metadata'].get('type') != 'feedback':
+            if msg['role'] == 'user' and msg['metadata'].get('type') != 'feedback':
                 return msg['content']
         return ""
     
@@ -678,9 +735,18 @@ class RAGPipeline:
         
         return '\n'.join(formatted)
     
-    def _format_response(self, sql_result: Dict, execution_result: Dict = None) -> str:
+    def _format_response(self, sql_result: Dict, execution_result: Dict = None, 
+                        entities: List[Dict] = None, candidate_tables: List[Dict] = None) -> str:
         """Format the assistant response"""
         response_parts = []
+        
+        # Show entity extraction results
+        if entities:
+            response_parts.append(f"**Entities Found:** {', '.join([e['entity'] for e in entities[:5]])}")
+        
+        # Show candidate tables
+        if candidate_tables:
+            response_parts.append(f"**Relevant Tables:** {', '.join([t['name'] for t in candidate_tables[:3]])}")
         
         if sql_result.get('sql'):
             response_parts.append(f"**SQL Query:**\n```sql\n{sql_result['sql']}\n```")
@@ -712,6 +778,9 @@ class RAGPipeline:
                 response_parts.append(f"\n*Note: I'm {confidence:.0%} confident about this query. Please provide feedback if it doesn't look right.*")
         else:
             response_parts.append("I couldn't generate a SQL query for your request. Could you please rephrase or provide more details?")
+            
+            if sql_result.get('error'):
+                response_parts.append(f"*Error: {sql_result['error']}*")
         
         return '\n\n'.join(response_parts)
     

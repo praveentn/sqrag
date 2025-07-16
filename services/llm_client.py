@@ -4,6 +4,7 @@ import time
 from typing import Dict, List, Any, Optional
 import json
 import requests
+import os
 
 # LLM client libraries
 try:
@@ -30,6 +31,7 @@ class LLMClient:
         self.llm_config = self.config.LLM_CONFIG
         self.provider = self.llm_config['provider']
         self.clients = {}
+        self.initialized = False
         
         # Initialize clients based on configuration
         self._initialize_clients()
@@ -38,87 +40,182 @@ class LLMClient:
         """Initialize LLM clients based on configuration"""
         try:
             if self.provider == 'azure_openai' and OPENAI_AVAILABLE:
-                self._initialize_azure_client()
+                success = self._initialize_azure_client()
+                if not success:
+                    self._fallback_to_mock()
             elif self.provider == 'openai' and OPENAI_AVAILABLE:
-                self._initialize_openai_client()
+                success = self._initialize_openai_client()
+                if not success:
+                    self._fallback_to_mock()
             elif self.provider == 'anthropic' and ANTHROPIC_AVAILABLE:
-                self._initialize_anthropic_client()
+                success = self._initialize_anthropic_client()
+                if not success:
+                    self._fallback_to_mock()
             else:
-                logger.warning(f"Provider {self.provider} not available, falling back to mock client")
+                logger.warning(f"Provider {self.provider} not available, using mock client")
                 self._initialize_mock_client()
                 
         except Exception as e:
             logger.error(f"Error initializing LLM clients: {str(e)}")
             self._initialize_mock_client()
     
-    def _initialize_azure_client(self):
+    def _initialize_azure_client(self) -> bool:
         """Initialize Azure OpenAI client"""
         try:
             azure_config = self.llm_config['azure']
             
-            if not azure_config.get('api_key'):
-                logger.warning("Azure OpenAI API key not provided")
-                self._initialize_mock_client()
-                return
+            # Check for required environment variables or config
+            api_key = azure_config.get('api_key') or os.getenv('AZURE_OPENAI_API_KEY')
+            endpoint = azure_config.get('endpoint') or os.getenv('AZURE_OPENAI_ENDPOINT')
+            
+            if not api_key or not endpoint:
+                logger.warning("Azure OpenAI API key or endpoint not provided")
+                return False
             
             self.clients['azure'] = AzureOpenAI(
-                api_key=azure_config['api_key'],
+                api_key=api_key,
                 api_version=azure_config['api_version'],
-                azure_endpoint=azure_config['endpoint']
+                azure_endpoint=endpoint
             )
             
-            logger.info("Azure OpenAI client initialized")
+            # Test the connection
+            test_result = self._test_azure_connection()
+            if test_result:
+                logger.info("Azure OpenAI client initialized and tested successfully")
+                self.initialized = True
+                return True
+            else:
+                logger.warning("Azure OpenAI client failed connection test")
+                return False
             
         except Exception as e:
             logger.error(f"Error initializing Azure OpenAI client: {str(e)}")
-            self._initialize_mock_client()
+            return False
     
-    def _initialize_openai_client(self):
+    def _initialize_openai_client(self) -> bool:
         """Initialize OpenAI client"""
         try:
             openai_config = self.llm_config['openai']
             
-            if not openai_config.get('api_key'):
+            api_key = openai_config.get('api_key') or os.getenv('OPENAI_API_KEY')
+            
+            if not api_key:
                 logger.warning("OpenAI API key not provided")
-                self._initialize_mock_client()
-                return
+                return False
             
-            self.clients['openai'] = OpenAI(api_key=openai_config['api_key'])
+            self.clients['openai'] = OpenAI(api_key=api_key)
             
-            logger.info("OpenAI client initialized")
+            # Test the connection
+            test_result = self._test_openai_connection()
+            if test_result:
+                logger.info("OpenAI client initialized and tested successfully")
+                self.initialized = True
+                return True
+            else:
+                logger.warning("OpenAI client failed connection test")
+                return False
             
         except Exception as e:
             logger.error(f"Error initializing OpenAI client: {str(e)}")
-            self._initialize_mock_client()
+            return False
     
-    def _initialize_anthropic_client(self):
+    def _initialize_anthropic_client(self) -> bool:
         """Initialize Anthropic client"""
         try:
             anthropic_config = self.llm_config['anthropic']
             
-            if not anthropic_config.get('api_key'):
+            api_key = anthropic_config.get('api_key') or os.getenv('ANTHROPIC_API_KEY')
+            
+            if not api_key:
                 logger.warning("Anthropic API key not provided")
-                self._initialize_mock_client()
-                return
+                return False
             
-            self.clients['anthropic'] = anthropic.Anthropic(api_key=anthropic_config['api_key'])
+            self.clients['anthropic'] = anthropic.Anthropic(api_key=api_key)
             
-            logger.info("Anthropic client initialized")
+            # Test the connection
+            test_result = self._test_anthropic_connection()
+            if test_result:
+                logger.info("Anthropic client initialized and tested successfully")
+                self.initialized = True
+                return True
+            else:
+                logger.warning("Anthropic client failed connection test")
+                return False
             
         except Exception as e:
             logger.error(f"Error initializing Anthropic client: {str(e)}")
-            self._initialize_mock_client()
+            return False
     
     def _initialize_mock_client(self):
         """Initialize mock client for development/testing"""
         self.clients['mock'] = MockLLMClient()
         self.provider = 'mock'
+        self.initialized = True
         logger.info("Mock LLM client initialized")
+    
+    def _fallback_to_mock(self):
+        """Fallback to mock client when real clients fail"""
+        logger.warning(f"Falling back to mock client for provider: {self.provider}")
+        self._initialize_mock_client()
+    
+    def _test_azure_connection(self) -> bool:
+        """Test Azure OpenAI connection"""
+        try:
+            client = self.clients['azure']
+            azure_config = self.llm_config['azure']
+            
+            response = client.chat.completions.create(
+                model=azure_config['deployment_name'],
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=5,
+                temperature=0.1
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Azure OpenAI connection test failed: {str(e)}")
+            return False
+    
+    def _test_openai_connection(self) -> bool:
+        """Test OpenAI connection"""
+        try:
+            client = self.clients['openai']
+            openai_config = self.llm_config['openai']
+            
+            response = client.chat.completions.create(
+                model=openai_config['model'],
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=5,
+                temperature=0.1
+            )
+            return True
+        except Exception as e:
+            logger.error(f"OpenAI connection test failed: {str(e)}")
+            return False
+    
+    def _test_anthropic_connection(self) -> bool:
+        """Test Anthropic connection"""
+        try:
+            client = self.clients['anthropic']
+            anthropic_config = self.llm_config['anthropic']
+            
+            response = client.messages.create(
+                model=anthropic_config['model'],
+                max_tokens=5,
+                messages=[{"role": "user", "content": "Test"}]
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Anthropic connection test failed: {str(e)}")
+            return False
     
     def generate(self, prompt: str, max_tokens: int = 1000, temperature: float = 0.7,
                 system_prompt: str = None) -> str:
         """Generate text using the configured LLM provider"""
         try:
+            if not self.initialized:
+                logger.warning("LLM client not properly initialized, using fallback")
+                return self._generate_fallback_response(prompt)
+            
             start_time = time.time()
             
             if self.provider == 'azure_openai':
@@ -238,17 +335,24 @@ class LLMClient:
         if 'select' in prompt_lower or 'sql' in prompt_lower:
             return json.dumps({
                 "sql": "SELECT * FROM customers LIMIT 10;",
-                "rationale": "Fallback query - please check and modify as needed",
+                "rationale": "Fallback query - LLM service unavailable",
                 "confidence": 0.3,
                 "tables_used": ["customers"],
                 "assumptions": ["Used fallback response due to LLM unavailability"]
             })
         
-        return "I apologize, but I'm unable to process your request at the moment due to technical issues. Please try again later."
+        return "I apologize, but I'm unable to process your request at the moment due to technical issues with the LLM service. Please check your API configuration or try again later."
     
     def test_connection(self) -> Dict[str, Any]:
         """Test connection to the LLM provider"""
         try:
+            if not self.initialized:
+                return {
+                    'status': 'error',
+                    'provider': self.provider,
+                    'message': 'LLM client not properly initialized'
+                }
+            
             test_prompt = "Hello, please respond with 'Connection successful'"
             response = self.generate(test_prompt, max_tokens=50, temperature=0.1)
             
@@ -275,24 +379,28 @@ class LLMClient:
                 'provider': 'Azure OpenAI',
                 'model': config['model_name'],
                 'deployment': config['deployment_name'],
-                'endpoint': config['endpoint']
+                'endpoint': config['endpoint'],
+                'initialized': self.initialized
             }
         elif self.provider == 'openai':
             config = self.llm_config['openai']
             return {
                 'provider': 'OpenAI',
-                'model': config['model']
+                'model': config['model'],
+                'initialized': self.initialized
             }
         elif self.provider == 'anthropic':
             config = self.llm_config['anthropic']
             return {
                 'provider': 'Anthropic',
-                'model': config['model']
+                'model': config['model'],
+                'initialized': self.initialized
             }
         else:
             return {
                 'provider': 'Mock',
-                'model': 'mock-model'
+                'model': 'mock-model',
+                'initialized': self.initialized
             }
 
 
@@ -331,6 +439,7 @@ class MockLLMClient:
             # Customize based on query content
             entities = []
             
+            # Analyze the prompt to extract table/column mentions
             if 'customer' in prompt_lower:
                 entities.extend([
                     {"entity": "customers", "type": "table", "confidence": 0.9},
@@ -345,7 +454,7 @@ class MockLLMClient:
                     {"entity": "order_id", "type": "column", "confidence": 0.9}
                 ])
             
-            if 'sales' in prompt_lower or 'revenue' in prompt_lower:
+            if any(word in prompt_lower for word in ['sales', 'revenue', 'amount', 'total']):
                 entities.extend([
                     {"entity": "sales", "type": "table", "confidence": 0.9},
                     {"entity": "total_amount", "type": "column", "confidence": 0.9},
@@ -389,4 +498,3 @@ class MockLLMClient:
         # General responses
         else:
             return f"Mock response for: {prompt[:100]}... (This is a simulated LLM response for development purposes)"
-        

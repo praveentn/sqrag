@@ -119,7 +119,26 @@
                     <div id="fileUploadSection" style="display: none;">
                         <div class="mb-3">
                             <label class="form-label">File</label>
-                            <input type="file" class="form-control" id="sourceFile" name="file" accept=".csv,.xlsx,.xls">
+                            <div class="file-upload-area" id="fileUploadArea">
+                                <div class="text-center">
+                                    <i class="fas fa-upload fa-3x text-muted mb-2"></i>
+                                    <p class="mb-1">Click to upload or drag and drop</p>
+                                    <small class="text-muted">CSV or Excel files only (max 100MB)</small>
+                                </div>
+                                <input type="file" id="sourceFile" name="file" accept=".csv,.xlsx,.xls" style="display: none;">
+                            </div>
+                            <div id="fileInfo" class="mt-2" style="display: none;">
+                                <div class="alert alert-info d-flex align-items-center">
+                                    <i class="fas fa-file me-2"></i>
+                                    <div>
+                                        <strong id="fileName"></strong><br>
+                                        <small id="fileSize"></small>
+                                    </div>
+                                    <button type="button" class="btn btn-sm btn-outline-danger ms-auto" onclick="clearFile()">
+                                        <i class="fas fa-times"></i>
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -222,8 +241,8 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-outline-primary" onclick="refresh_metadata()">
-                    <i class="fas fa-refresh me-1"></i>Refresh _metadata
+                <button type="button" class="btn btn-outline-primary" onclick="refreshSourceMetadata()">
+                    <i class="fas fa-refresh me-1"></i>Refresh Metadata
                 </button>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
             </div>
@@ -266,8 +285,46 @@ let allDataSources = [];
 
 document.addEventListener('DOMContentLoaded', function() {
     loadDataSources();
-    setupFileUpload();
+    setupFileUploadHandlers();
 });
+
+function setupFileUploadHandlers() {
+    const uploadArea = document.getElementById('fileUploadArea');
+    const fileInput = document.getElementById('sourceFile');
+    
+    if (uploadArea && fileInput) {
+        // Click to upload
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        // Drag and drop
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                fileInput.files = files;
+                handleFileSelect(files[0]);
+            }
+        });
+        
+        // File input change
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileSelect(e.target.files[0]);
+            }
+        });
+    }
+}
 
 async function loadDataSources() {
     try {
@@ -290,12 +347,12 @@ function updateOverviewCards(sources) {
     let totalRows = 0;
     let totalColumns = 0;
     
-    // These would normally come from the API response
-    // For now, we'll use placeholder calculations
+    // Calculate actual totals from source data
     sources.forEach(source => {
-        totalTables += Math.floor(Math.random() * 10) + 1; // Placeholder
-        totalRows += Math.floor(Math.random() * 100000) + 1000; // Placeholder
-        totalColumns += Math.floor(Math.random() * 50) + 5; // Placeholder
+        // These should come from the actual API response
+        totalTables += source.table_count || 0;
+        totalRows += source.row_count || 0;
+        totalColumns += source.column_count || 0;
     });
     
     document.getElementById('totalTables').textContent = totalTables;
@@ -345,7 +402,7 @@ function displayDataSources(sources) {
 
 function createSourceRow(source) {
     const typeIcon = getTypeIcon(source.type);
-    const statusBadge = getStatusBadge('active'); // Placeholder
+    const statusBadge = getStatusBadge('active'); // You can add actual status logic here
     const lastRefresh = source.last_refresh ? 
         new Date(source.last_refresh).toLocaleString() : 'Never';
     
@@ -368,7 +425,7 @@ function createSourceRow(source) {
                 <small>${lastRefresh}</small>
             </td>
             <td>
-                <span class="badge bg-info">${Math.floor(Math.random() * 10) + 1}</span>
+                <span class="badge bg-info">${source.table_count || 0}</span>
             </td>
             <td>
                 <div class="btn-group btn-group-sm">
@@ -378,7 +435,7 @@ function createSourceRow(source) {
                     <button class="btn btn-outline-secondary" onclick="testSourceConnection(${source.id})" title="Test Connection">
                         <i class="fas fa-plug"></i>
                     </button>
-                    <button class="btn btn-outline-info" onclick="refreshSource_metadata(${source.id})" title="Refresh">
+                    <button class="btn btn-outline-info" onclick="refreshSourceMetadata(${source.id})" title="Refresh">
                         <i class="fas fa-refresh"></i>
                     </button>
                     <button class="btn btn-outline-warning" onclick="editDataSource(${source.id})" title="Edit">
@@ -425,13 +482,6 @@ function filterDataSources() {
     });
     
     displayDataSources(filteredSources);
-}
-
-function setupFileUpload() {
-    const uploadArea = document.getElementById('fileUploadArea');
-    const fileInput = document.getElementById('sourceFile');
-    
-    setupFileUpload(uploadArea, fileInput, handleFileSelect);
 }
 
 function handleFileSelect(file) {
@@ -642,13 +692,14 @@ function buildConnectionString() {
     return `${sourceType}://${username}:${password}@${host}:${port}/${database}`;
 }
 
-
 async function showSourceDetails(sourceId) {
     currentSourceId = sourceId;
     
     try {
-        // Find source in our array
+        // Get source statistics
+        const stats = await apiRequest(`/api/data-sources/${sourceId}/stats`);
         const source = allDataSources.find(s => s.id === sourceId);
+        
         if (!source) {
             showToast('Source not found', 'danger');
             return;
@@ -657,8 +708,8 @@ async function showSourceDetails(sourceId) {
         document.getElementById('sourceDetailsTitle').textContent = `${source.name} - Details`;
         
         // Load source statistics and tables
-        loadSourceTables(sourceId);
-        loadSourceStats(sourceId);
+        await loadSourceTables(sourceId);
+        await loadSourceStats(sourceId);
         
         const modal = new bootstrap.Modal(document.getElementById('sourceDetailsModal'));
         modal.show();
@@ -671,15 +722,13 @@ async function showSourceDetails(sourceId) {
 
 async function loadSourceTables(sourceId) {
     try {
-        // This would fetch tables from API
+        const stats = await apiRequest(`/api/data-sources/${sourceId}/stats`);
         const tablesContainer = document.getElementById('sourceTablesContainer');
         
-        // Placeholder data
-        const tables = [
-            { name: 'customers', row_count: 1250, column_count: 8, description: 'Customer information' },
-            { name: 'orders', row_count: 3420, column_count: 12, description: 'Order transactions' },
-            { name: 'products', row_count: 156, column_count: 6, description: 'Product catalog' }
-        ];
+        if (!stats.tables || stats.tables.length === 0) {
+            tablesContainer.innerHTML = '<div class="text-center text-muted p-3">No tables found</div>';
+            return;
+        }
         
         tablesContainer.innerHTML = `
             <div class="table-responsive">
@@ -693,14 +742,14 @@ async function loadSourceTables(sourceId) {
                         </tr>
                     </thead>
                     <tbody>
-                        ${tables.map(table => `
+                        ${stats.tables.map(table => `
                             <tr>
                                 <td>
                                     <div class="fw-bold">${table.name}</div>
-                                    <small class="text-muted">${table.description || 'No description'}</small>
+                                    <small class="text-muted">${table.display_name || 'No description'}</small>
                                 </td>
-                                <td>${table.row_count.toLocaleString()}</td>
-                                <td>${table.column_count}</td>
+                                <td>${table.row_count ? table.row_count.toLocaleString() : 0}</td>
+                                <td>${table.column_count || 0}</td>
                                 <td>
                                     <button class="btn btn-sm btn-outline-primary" onclick="showSampleData('${table.name}')">
                                         <i class="fas fa-eye"></i>
@@ -718,43 +767,33 @@ async function loadSourceTables(sourceId) {
         
     } catch (error) {
         console.error('Error loading source tables:', error);
+        document.getElementById('sourceTablesContainer').innerHTML = 
+            '<div class="text-center text-danger p-3">Error loading tables</div>';
     }
 }
 
 async function loadSourceStats(sourceId) {
     try {
+        const stats = await apiRequest(`/api/data-sources/${sourceId}/stats`);
         const statsContainer = document.getElementById('sourceStatsContainer');
-        
-        // Placeholder stats
-        const stats = {
-            total_tables: 3,
-            total_rows: 4826,
-            total_columns: 26,
-            last_refresh: new Date().toISOString(),
-            file_size: '2.4 MB'
-        };
         
         statsContainer.innerHTML = `
             <div class="list-group list-group-flush">
                 <div class="list-group-item d-flex justify-content-between">
                     <span>Tables</span>
-                    <strong>${stats.total_tables}</strong>
+                    <strong>${stats.total_tables || 0}</strong>
                 </div>
                 <div class="list-group-item d-flex justify-content-between">
                     <span>Total Rows</span>
-                    <strong>${stats.total_rows.toLocaleString()}</strong>
+                    <strong>${(stats.total_rows || 0).toLocaleString()}</strong>
                 </div>
                 <div class="list-group-item d-flex justify-content-between">
                     <span>Total Columns</span>
-                    <strong>${stats.total_columns}</strong>
-                </div>
-                <div class="list-group-item d-flex justify-content-between">
-                    <span>File Size</span>
-                    <strong>${stats.file_size}</strong>
+                    <strong>${stats.total_columns || 0}</strong>
                 </div>
                 <div class="list-group-item">
                     <small class="text-muted">
-                        Last refresh: ${new Date(stats.last_refresh).toLocaleString()}
+                        Last refresh: ${stats.last_refresh ? new Date(stats.last_refresh).toLocaleString() : 'Never'}
                     </small>
                 </div>
             </div>
@@ -762,6 +801,8 @@ async function loadSourceStats(sourceId) {
         
     } catch (error) {
         console.error('Error loading source stats:', error);
+        document.getElementById('sourceStatsContainer').innerHTML = 
+            '<div class="text-center text-danger p-3">Error loading statistics</div>';
     }
 }
 
@@ -770,18 +811,10 @@ async function showSampleData(tableName) {
         const container = document.getElementById('sampleDataContainer');
         container.innerHTML = '<div class="text-center p-3"><div class="loading-spinner me-2"></div>Loading sample data...</div>';
         
-        // Simulate API call
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        const sampleData = await apiRequest(`/api/data-sources/${currentSourceId}/sample?table=${tableName}`);
         
-        // Placeholder sample data
-        const sampleData = [
-            { id: 1, name: 'John Doe', email: 'john@example.com', created_at: '2024-01-15' },
-            { id: 2, name: 'Jane Smith', email: 'jane@example.com', created_at: '2024-01-16' },
-            { id: 3, name: 'Bob Johnson', email: 'bob@example.com', created_at: '2024-01-17' }
-        ];
-        
-        if (sampleData.length > 0) {
-            const columns = Object.keys(sampleData[0]);
+        if (sampleData.data && sampleData.data.length > 0) {
+            const columns = sampleData.columns;
             const tableHtml = `
                 <div class="table-responsive">
                     <table class="table table-striped table-sm">
@@ -789,14 +822,14 @@ async function showSampleData(tableName) {
                             <tr>${columns.map(col => `<th>${col}</th>`).join('')}</tr>
                         </thead>
                         <tbody>
-                            ${sampleData.map(row => 
+                            ${sampleData.data.map(row => 
                                 `<tr>${columns.map(col => `<td>${row[col] || ''}</td>`).join('')}</tr>`
                             ).join('')}
                         </tbody>
                     </table>
                 </div>
                 <div class="text-muted text-center mt-2">
-                    <small>Showing sample data from ${tableName}</small>
+                    <small>Showing ${sampleData.data.length} of ${sampleData.total_rows} rows from ${tableName}</small>
                 </div>
             `;
             container.innerHTML = tableHtml;
@@ -811,27 +844,29 @@ async function showSampleData(tableName) {
     }
 }
 
-async function refreshSource_metadata(sourceId) {
+async function refreshSourceMetadata(sourceId = null) {
     try {
-        showToast('Refreshing _metadata...', 'info');
+        const targetId = sourceId || currentSourceId;
+        if (!targetId) return;
         
-        // Simulate API call
-        await apiRequest(`/api/data-sources/${sourceId}/refresh`, {
+        showToast('Refreshing metadata...', 'info');
+        
+        await apiRequest(`/api/data-sources/${targetId}/refresh`, {
             method: 'POST'
         });
         
-        showToast('_metadata refreshed successfully', 'success');
+        showToast('Metadata refreshed successfully', 'success');
         
-        if (currentSourceId === sourceId) {
-            loadSourceTables(sourceId);
-            loadSourceStats(sourceId);
+        if (currentSourceId === targetId) {
+            await loadSourceTables(targetId);
+            await loadSourceStats(targetId);
         }
         
         loadDataSources();
         
     } catch (error) {
-        console.error('Error refreshing _metadata:', error);
-        showToast('Error refreshing _metadata: ' + error.message, 'danger');
+        console.error('Error refreshing metadata:', error);
+        showToast('Error refreshing metadata: ' + error.message, 'danger');
     }
 }
 
@@ -914,6 +949,19 @@ async function saveDescription() {
         console.error('Error saving description:', error);
         showToast('Error saving description: ' + error.message, 'danger');
     }
+}
+
+// Utility function for formatting bytes
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+    
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 </script>
 {% endblock %}

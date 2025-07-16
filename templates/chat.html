@@ -226,13 +226,14 @@ async function loadChatSessions() {
         }
         
         container.innerHTML = sessions.map(session => `
-            <div class="chat-session-item border-bottom p-3 cursor-pointer" onclick="loadChatSession(${session.id})">
+            <div class="chat-session-item border-bottom p-3 cursor-pointer ${currentSessionId === session.id ? 'active' : ''}" 
+                 onclick="loadChatSession(${session.id})">
                 <div class="d-flex justify-content-between align-items-start">
                     <div class="flex-grow-1">
                         <h6 class="mb-1">${session.title}</h6>
                         <small class="text-muted">${new Date(session.created_at).toLocaleDateString()}</small>
                     </div>
-                    <div class="dropdown">
+                    <div class="dropdown" onclick="event.stopPropagation();">
                         <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="dropdown">
                             <i class="fas fa-ellipsis-v"></i>
                         </button>
@@ -257,7 +258,10 @@ async function loadChatSessions() {
                 border-left: 4px solid var(--primary-color);
             }
         `;
-        document.head.appendChild(style);
+        if (!document.getElementById('chat-session-styles')) {
+            style.id = 'chat-session-styles';
+            document.head.appendChild(style);
+        }
         
     } catch (error) {
         console.error('Error loading chat sessions:', error);
@@ -281,7 +285,7 @@ async function newChatSession() {
         document.getElementById('chatMessages').innerHTML = getWelcomeMessage();
         
         // Reload sessions list
-        loadChatSessions();
+        await loadChatSessions();
         
         // Focus on input
         document.getElementById('queryInput').focus();
@@ -302,11 +306,13 @@ async function loadChatSession(sessionId) {
         });
         event.target.closest('.chat-session-item').classList.add('active');
         
+        // Load session details
+        const session = await apiRequest(`/api/chat/sessions/${sessionId}`);
+        
         // Load session messages
         const messages = await apiRequest(`/api/chat/sessions/${sessionId}/messages`);
         
         // Update chat header
-        const session = await apiRequest(`/api/chat/sessions/${sessionId}`);
         document.getElementById('chatTitle').textContent = session.title || 'Chat Session';
         document.getElementById('chatSubtitle').textContent = `Created ${new Date(session.created_at).toLocaleString()}`;
         document.getElementById('chatActions').style.display = 'block';
@@ -336,7 +342,7 @@ function displayMessages(messages) {
 
 function formatMessage(message) {
     const isUser = message.role === 'user';
-    const _metadata = message._metadata || {};
+    const metadata = message.metadata || {};
     
     let messageHtml = `
         <div class="message ${message.role}">
@@ -348,16 +354,19 @@ function formatMessage(message) {
     `;
     
     // Add action buttons for assistant messages with SQL
-    if (!isUser && _metadata.sql_result && _metadata.sql_result.sql) {
+    if (!isUser && metadata.sql && metadata.execution_result) {
         messageHtml += `
             <div class="mt-2">
-                <button class="btn btn-sm btn-outline-primary me-2" onclick="showSqlResults(${message.id})">
+                <button class="btn btn-sm btn-outline-primary me-2" onclick="showSqlResults(${message.id})" 
+                        data-sql="${encodeURIComponent(metadata.sql)}" 
+                        data-result="${encodeURIComponent(JSON.stringify(metadata.execution_result))}"
+                        data-confidence="${metadata.confidence || 0}">
                     <i class="fas fa-table me-1"></i>View Results
                 </button>
                 <button class="btn btn-sm btn-outline-secondary me-2" onclick="showFeedbackModal(${message.id})">
                     <i class="fas fa-comment me-1"></i>Feedback
                 </button>
-                <button class="btn btn-sm btn-outline-info" onclick="copySql(${message.id})">
+                <button class="btn btn-sm btn-outline-info" onclick="copySql('${encodeURIComponent(metadata.sql)}')">
                     <i class="fas fa-copy me-1"></i>Copy SQL
                 </button>
             </div>
@@ -468,7 +477,7 @@ async function sendQuery() {
     }
 }
 
-function addMessageToUI(role, content, _metadata = null, isError = false) {
+function addMessageToUI(role, content, metadata = null, isError = false) {
     const container = document.getElementById('chatMessages');
     
     // Remove welcome message if present
@@ -491,24 +500,24 @@ function addMessageToUI(role, content, _metadata = null, isError = false) {
     messageMeta.innerHTML = `<small class="text-muted">${new Date().toLocaleTimeString()}</small>`;
     
     // Add action buttons for assistant messages with SQL
-    if (role === 'assistant' && _metadata && _metadata.sql) {
+    if (role === 'assistant' && metadata && metadata.sql) {
         const actionsDiv = document.createElement('div');
         actionsDiv.className = 'mt-2';
         actionsDiv.innerHTML = `
-            <button class="btn btn-sm btn-outline-primary me-2" onclick="showSqlResultsFrom_metadata(this)">
+            <button class="btn btn-sm btn-outline-primary me-2" 
+                    onclick="showSqlResultsFromMetadata(this)" 
+                    data-sql="${encodeURIComponent(metadata.sql)}" 
+                    data-result="${encodeURIComponent(JSON.stringify(metadata.execution_result || {}))}"
+                    data-confidence="${metadata.confidence || 0}">
                 <i class="fas fa-table me-1"></i>View Results
             </button>
-            <button class="btn btn-sm btn-outline-secondary me-2" onclick="showFeedbackModal()">
+            <button class="btn btn-sm btn-outline-secondary me-2" onclick="showFeedbackModal(${metadata.message_id || currentMessageId})">
                 <i class="fas fa-comment me-1"></i>Feedback
             </button>
-            <button class="btn btn-sm btn-outline-info" onclick="copySqlFrom_metadata(this)">
+            <button class="btn btn-sm btn-outline-info" onclick="copySql('${encodeURIComponent(metadata.sql)}')">
                 <i class="fas fa-copy me-1"></i>Copy SQL
             </button>
         `;
-        
-        // Store _metadata in the button for later use
-        actionsDiv.querySelector('[onclick*="showSqlResultsFrom_metadata"]')._metadata = _metadata;
-        actionsDiv.querySelector('[onclick*="copySqlFrom_metadata"]')._metadata = _metadata;
         
         messageMeta.appendChild(actionsDiv);
     }
@@ -521,34 +530,43 @@ function addMessageToUI(role, content, _metadata = null, isError = false) {
     container.scrollTop = container.scrollHeight;
 }
 
-function showSqlResultsFrom_metadata(button) {
-    const _metadata = button._metadata;
-    if (_metadata && _metadata.execution_result) {
-        populateSqlResultsModal(_metadata.sql, _metadata.execution_result, _metadata);
+function showSqlResultsFromMetadata(button) {
+    try {
+        const sql = decodeURIComponent(button.getAttribute('data-sql'));
+        const result = JSON.parse(decodeURIComponent(button.getAttribute('data-result')));
+        const confidence = parseFloat(button.getAttribute('data-confidence') || 0);
+        
+        populateSqlResultsModal(sql, result, { confidence });
         const modal = new bootstrap.Modal(document.getElementById('sqlResultsModal'));
         modal.show();
+    } catch (error) {
+        console.error('Error showing SQL results:', error);
+        showToast('Error displaying SQL results', 'danger');
     }
 }
 
-function copySqlFrom_metadata(button) {
-    const _metadata = button._metadata;
-    if (_metadata && _metadata.sql) {
-        navigator.clipboard.writeText(_metadata.sql);
+function copySql(encodedSql) {
+    try {
+        const sql = decodeURIComponent(encodedSql);
+        navigator.clipboard.writeText(sql);
         showToast('SQL copied to clipboard', 'success');
+    } catch (error) {
+        console.error('Error copying SQL:', error);
+        showToast('Error copying SQL to clipboard', 'danger');
     }
 }
 
 async function showSqlResults(messageId) {
     try {
-        // This would fetch message details from API
-        showToast('Feature not fully implemented', 'info');
+        showToast('Loading SQL results...', 'info');
+        // This would fetch message details from API if needed
     } catch (error) {
         console.error('Error showing SQL results:', error);
         showToast('Error loading SQL results', 'danger');
     }
 }
 
-function populateSqlResultsModal(sql, executionResult, _metadata) {
+function populateSqlResultsModal(sql, executionResult, metadata = {}) {
     document.getElementById('modalSqlCode').textContent = sql;
     
     // Populate statistics
@@ -557,18 +575,18 @@ function populateSqlResultsModal(sql, executionResult, _metadata) {
     document.getElementById('modalRowCount').textContent = 
         executionResult.row_count || 0;
     document.getElementById('modalConfidence').textContent = 
-        _metadata.confidence ? `${Math.round(_metadata.confidence * 100)}%` : 'N/A';
+        metadata.confidence ? `${Math.round(metadata.confidence * 100)}%` : 'N/A';
     
     // Populate tables used
-    const tablesUsed = _metadata.candidate_tables || [];
+    const tablesUsed = metadata.candidate_tables || [];
     document.getElementById('modalTablesUsed').innerHTML = 
         tablesUsed.length > 0 ? tablesUsed.join(', ') : 'N/A';
     
     // Populate results table
     const resultsContainer = document.getElementById('modalResultsTable');
-    if (executionResult.preview_data && executionResult.preview_data.length > 0) {
-        const data = executionResult.preview_data;
-        const columns = Object.keys(data[0]);
+    if (executionResult.data && executionResult.data.length > 0) {
+        const data = executionResult.data;
+        const columns = executionResult.columns || Object.keys(data[0]);
         
         let tableHtml = `
             <table class="table table-striped table-hover">
@@ -608,6 +626,7 @@ function copySqlToClipboard() {
 
 function showFeedbackModal(messageId = null) {
     currentMessageId = messageId || currentMessageId;
+    document.getElementById('feedbackForm').reset();
     const modal = new bootstrap.Modal(document.getElementById('feedbackModal'));
     modal.show();
 }
@@ -648,7 +667,6 @@ async function exportChat() {
     if (!currentSessionId) return;
     
     try {
-        // This would export the chat session
         showToast('Export feature not fully implemented', 'info');
     } catch (error) {
         console.error('Error exporting chat:', error);
@@ -661,26 +679,61 @@ async function clearChat() {
     
     if (confirm('Are you sure you want to clear this chat? This action cannot be undone.')) {
         try {
-            await apiRequest(`/api/chat/sessions/${currentSessionId}`, {
-                method: 'DELETE'
-            });
-            
-            // Reset UI
+            await deleteSession(currentSessionId);
+        } catch (error) {
+            console.error('Error deleting chat:', error);
+            showToast('Error deleting chat', 'danger');
+        }
+    }
+}
+
+async function deleteSession(sessionId) {
+    try {
+        await apiRequest(`/api/chat/sessions/${sessionId}`, {
+            method: 'DELETE'
+        });
+        
+        // Reset UI if this was the current session
+        if (currentSessionId === sessionId) {
             currentSessionId = null;
             currentMessageId = null;
             document.getElementById('chatTitle').textContent = 'Select a chat or start a new one';
             document.getElementById('chatSubtitle').textContent = '';
             document.getElementById('chatActions').style.display = 'none';
             document.getElementById('chatMessages').innerHTML = getWelcomeMessage();
+        }
+        
+        // Reload sessions
+        await loadChatSessions();
+        
+        showToast('Chat deleted successfully', 'success');
+        
+    } catch (error) {
+        console.error('Error deleting session:', error);
+        showToast('Error deleting chat session', 'danger');
+        throw error;
+    }
+}
+
+async function renameSession(sessionId) {
+    const newTitle = prompt('Enter new title for this chat:');
+    if (newTitle && newTitle.trim()) {
+        try {
+            await apiRequest(`/api/chat/sessions/${sessionId}`, {
+                method: 'PUT',
+                body: JSON.stringify({ title: newTitle.trim() })
+            });
             
-            // Reload sessions
-            loadChatSessions();
+            await loadChatSessions();
             
-            showToast('Chat deleted successfully', 'success');
+            if (currentSessionId === sessionId) {
+                document.getElementById('chatTitle').textContent = newTitle.trim();
+            }
             
+            showToast('Chat renamed successfully', 'success');
         } catch (error) {
-            console.error('Error deleting chat:', error);
-            showToast('Error deleting chat', 'danger');
+            console.error('Error renaming session:', error);
+            showToast('Error renaming chat session', 'danger');
         }
     }
 }

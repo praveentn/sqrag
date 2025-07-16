@@ -17,14 +17,14 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 class DataSourceManager:
-    """Manages data source connections and _metadata extraction"""
+    """Manages data source connections and metadata extraction"""
     
     def __init__(self):
         self.config = Config()
         self.supported_types = ['csv', 'excel', 'postgresql', 'mysql', 'sqlite', 'mssql']
         
     def create_source(self, name: str, type: str, connection_string: str = '', 
-                     file_path: str = '', _metadata: Dict = None) -> DataSource:
+                     file_path: str = '', metadata: Dict = None) -> DataSource:
         """Create a new data source"""
         try:
             # Validate type
@@ -37,15 +37,18 @@ class DataSourceManager:
                 type=type,
                 connection_string=connection_string,
                 file_path=file_path,
-                _metadata=_metadata or {},
+                metadata=metadata or {},
                 created_at=datetime.utcnow()
             )
             
             db.session.add(source)
             db.session.commit()
             
-            # Extract _metadata immediately
-            self.refresh__metadata(source)
+            # Extract metadata immediately
+            try:
+                self.refresh_metadata(source)
+            except Exception as e:
+                logger.warning(f"Failed to extract metadata during creation: {str(e)}")
             
             logger.info(f"Created data source: {name} (type: {type})")
             return source
@@ -139,33 +142,33 @@ class DataSourceManager:
                 'timestamp': datetime.utcnow().isoformat()
             }
     
-    def refresh__metadata(self, source: DataSource) -> None:
-        """Refresh _metadata for a data source"""
+    def refresh_metadata(self, source: DataSource) -> None:
+        """Refresh metadata for a data source"""
         try:
             if source.type in ['csv', 'excel']:
-                self._extract_file__metadata(source)
+                self._extract_file_metadata(source)
             else:
-                self._extract_database__metadata(source)
+                self._extract_database_metadata(source)
             
             source.last_refresh = datetime.utcnow()
             db.session.commit()
             
-            logger.info(f"Refreshed _metadata for source: {source.name}")
+            logger.info(f"Refreshed metadata for source: {source.name}")
             
         except Exception as e:
             db.session.rollback()
-            logger.error(f"Error refreshing _metadata for {source.name}: {str(e)}")
+            logger.error(f"Error refreshing metadata for {source.name}: {str(e)}")
             raise
     
-    def _extract_file__metadata(self, source: DataSource) -> None:
-        """Extract _metadata from file-based sources"""
+    def _extract_file_metadata(self, source: DataSource) -> None:
+        """Extract metadata from file-based sources"""
         if source.type == 'csv':
-            self._extract_csv__metadata(source)
+            self._extract_csv_metadata(source)
         elif source.type == 'excel':
-            self._extract_excel__metadata(source)
+            self._extract_excel_metadata(source)
     
-    def _extract_csv__metadata(self, source: DataSource) -> None:
-        """Extract _metadata from CSV file"""
+    def _extract_csv_metadata(self, source: DataSource) -> None:
+        """Extract metadata from CSV file"""
         try:
             # Read CSV file
             df = pd.read_csv(source.file_path)
@@ -190,15 +193,15 @@ class DataSourceManager:
             # Update source row count
             source.row_count = len(df)
             
-            # Extract column _metadata
+            # Extract column metadata
             self._extract_columns_from_dataframe(table, df)
             
         except Exception as e:
-            logger.error(f"Error extracting CSV _metadata: {str(e)}")
+            logger.error(f"Error extracting CSV metadata: {str(e)}")
             raise
     
-    def _extract_excel__metadata(self, source: DataSource) -> None:
-        """Extract _metadata from Excel file"""
+    def _extract_excel_metadata(self, source: DataSource) -> None:
+        """Extract metadata from Excel file"""
         try:
             xl_file = pd.ExcelFile(source.file_path)
             total_rows = 0
@@ -224,18 +227,18 @@ class DataSourceManager:
                 table.updated_at = datetime.utcnow()
                 total_rows += len(df)
                 
-                # Extract column _metadata
+                # Extract column metadata
                 self._extract_columns_from_dataframe(table, df)
             
             # Update source row count
             source.row_count = total_rows
             
         except Exception as e:
-            logger.error(f"Error extracting Excel _metadata: {str(e)}")
+            logger.error(f"Error extracting Excel metadata: {str(e)}")
             raise
     
-    def _extract_database__metadata(self, source: DataSource) -> None:
-        """Extract _metadata from database source"""
+    def _extract_database_metadata(self, source: DataSource) -> None:
+        """Extract metadata from database source"""
         try:
             engine = create_engine(source.connection_string)
             inspector = inspect(engine)
@@ -274,30 +277,30 @@ class DataSourceManager:
                     except:
                         table.row_count = 0
                     
-                    # Extract column _metadata
+                    # Extract column metadata
                     self._extract_database_columns(table, inspector, table_name, schema_name, engine)
             
             # Update source row count
             source.row_count = total_rows
             
         except Exception as e:
-            logger.error(f"Error extracting database _metadata: {str(e)}")
+            logger.error(f"Error extracting database metadata: {str(e)}")
             raise
     
     def _extract_columns_from_dataframe(self, table: Table, df: pd.DataFrame) -> None:
-        """Extract column _metadata from pandas DataFrame"""
+        """Extract column metadata from pandas DataFrame"""
+        # Clear existing columns
+        for existing_col in table.columns:
+            db.session.delete(existing_col)
+        
         for col_name in df.columns:
-            # Create or update column record
-            column = Column.query.filter_by(table_id=table.id, name=col_name).first()
-            
-            if not column:
-                column = Column(
-                    name=col_name,
-                    display_name=col_name.replace('_', ' ').title(),
-                    table_id=table.id,
-                    created_at=datetime.utcnow()
-                )
-                db.session.add(column)
+            # Create column record
+            column = Column(
+                name=col_name,
+                display_name=col_name.replace('_', ' ').title(),
+                table_id=table.id,
+                created_at=datetime.utcnow()
+            )
             
             # Infer data type
             column.data_type = str(df[col_name].dtype)
@@ -311,10 +314,12 @@ class DataSourceManager:
             if len(sample_values) > 10:
                 sample_values = sample_values[:10]
             column.sample_values = [str(val) for val in sample_values.tolist()]
+            
+            db.session.add(column)
     
     def _extract_database_columns(self, table: Table, inspector, table_name: str, 
                                  schema_name: str, engine) -> None:
-        """Extract column _metadata from database table"""
+        """Extract column metadata from database table"""
         columns_info = inspector.get_columns(table_name, schema=schema_name)
         pk_columns = inspector.get_pk_constraint(table_name, schema=schema_name)
         fk_columns = inspector.get_foreign_keys(table_name, schema=schema_name)
@@ -323,20 +328,20 @@ class DataSourceManager:
         fk_column_names = [fk['constrained_columns'][0] for fk in fk_columns 
                           if fk.get('constrained_columns')]
         
+        # Clear existing columns
+        for existing_col in table.columns:
+            db.session.delete(existing_col)
+        
         for col_info in columns_info:
             col_name = col_info['name']
             
-            # Create or update column record
-            column = Column.query.filter_by(table_id=table.id, name=col_name).first()
-            
-            if not column:
-                column = Column(
-                    name=col_name,
-                    display_name=col_name.replace('_', ' ').title(),
-                    table_id=table.id,
-                    created_at=datetime.utcnow()
-                )
-                db.session.add(column)
+            # Create column record
+            column = Column(
+                name=col_name,
+                display_name=col_name.replace('_', ' ').title(),
+                table_id=table.id,
+                created_at=datetime.utcnow()
+            )
             
             column.data_type = str(col_info.get('type', 'unknown'))
             column.is_nullable = col_info.get('nullable', True)
@@ -369,6 +374,8 @@ class DataSourceManager:
                 column.sample_values = []
                 column.unique_count = 0
                 column.null_count = 0
+            
+            db.session.add(column)
     
     def get_sample_data(self, source: DataSource, table_name: str = None, limit: int = 100) -> Dict[str, Any]:
         """Get sample data from source"""
@@ -407,7 +414,7 @@ class DataSourceManager:
                     query = text(f"SELECT * FROM {table_to_query} LIMIT {limit}")
                     result = conn.execute(query)
                     columns = result.keys()
-                    data = [dict(row) for row in result.fetchall()]
+                    data = [dict(row._mapping) for row in result.fetchall()]
                     
                     # Get total count
                     count_query = text(f"SELECT COUNT(*) FROM {table_to_query}")
@@ -425,9 +432,17 @@ class DataSourceManager:
             raise
     
     def delete_source(self, source_id: int) -> None:
-        """Delete a data source and all its _metadata"""
+        """Delete a data source and all its metadata"""
         try:
             source = DataSource.query.get_or_404(source_id)
+            
+            # Delete associated file if it exists
+            if source.file_path and os.path.exists(source.file_path):
+                try:
+                    os.remove(source.file_path)
+                    logger.info(f"Deleted file: {source.file_path}")
+                except Exception as e:
+                    logger.warning(f"Could not delete file {source.file_path}: {str(e)}")
             
             # Cascade delete will handle tables and columns
             db.session.delete(source)

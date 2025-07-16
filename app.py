@@ -7,6 +7,8 @@ import json
 import yaml
 from datetime import datetime
 import logging
+from werkzeug.utils import secure_filename
+import uuid
 from services.data_source_manager import DataSourceManager
 from services.dictionary_service import DictionaryService
 from services.embedding_service import EmbeddingService
@@ -38,6 +40,9 @@ sql_executor = SQLExecutor()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Ensure upload directory exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Routes
 
@@ -78,24 +83,26 @@ def admin():
 @app.route('/api/data-sources', methods=['GET'])
 def get_data_sources():
     """Get all data sources"""
-    sources = DataSource.query.all()
-    return jsonify([{
-        'id': s.id,
-        'name': s.name,
-        'type': s.type,
-        'connection_string': s.connection_string,
-        'created_at': s.created_at.isoformat(),
-        'last_refresh': s.last_refresh.isoformat() if s.last_refresh else None
-    } for s in sources])
+    try:
+        sources = DataSource.query.all()
+        sources_data = []
+        
+        for source in sources:
+            source_dict = source.to_dict()
+            # Add table and column counts
+            source_dict['table_count'] = len(source.tables)
+            source_dict['column_count'] = sum(len(table.columns) for table in source.tables)
+            sources_data.append(source_dict)
+        
+        return jsonify(sources_data)
+    except Exception as e:
+        logger.error(f"Error getting data sources: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
-# app.py - Update the create_data_source route
 @app.route('/api/data-sources', methods=['POST'])
 def create_data_source():
     """Create new data source"""
     try:
-        # Ensure upload directory exists
-        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-        
         # Handle both JSON and form data
         if request.content_type and 'multipart/form-data' in request.content_type:
             # File upload case
@@ -108,19 +115,25 @@ def create_data_source():
             if 'file' in request.files:
                 file = request.files['file']
                 if file and file.filename:
-                    # Save file with secure filename
-                    import uuid
-                    from werkzeug.utils import secure_filename
+                    # Validate file type
+                    allowed_extensions = {'.csv', '.xlsx', '.xls'}
+                    file_ext = os.path.splitext(file.filename)[1].lower()
                     
+                    if file_ext not in allowed_extensions:
+                        return jsonify({'error': 'Invalid file type. Only CSV and Excel files are allowed.'}), 400
+                    
+                    # Save file
                     filename = secure_filename(file.filename)
                     unique_filename = f"{uuid.uuid4().hex}_{filename}"
                     file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
                     
-                    # Save the file
+                    # Ensure upload directory exists
+                    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+                    
                     file.save(file_path)
                     data['file_path'] = file_path
                     
-                    logger.info(f"File saved: {file_path}")
+                    logger.info(f"File saved to: {file_path}")
             
             # Handle database connection
             if data['type'] not in ['csv', 'excel']:
@@ -142,12 +155,7 @@ def create_data_source():
             metadata={'description': data.get('description', '')}
         )
         
-        logger.info(f"Created data source: {source.name}")
-        return jsonify({
-            'id': source.id, 
-            'message': 'Data source created successfully',
-            'source': source.to_dict()
-        })
+        return jsonify({'id': source.id, 'message': 'Data source created successfully'})
         
     except Exception as e:
         logger.error(f"Error creating data source: {str(e)}")
@@ -165,14 +173,14 @@ def test_connection(source_id):
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/data-sources/<int:source_id>/refresh', methods=['POST'])
-def refresh__metadata(source_id):
-    """Refresh _metadata for data source"""
+def refresh_metadata(source_id):
+    """Refresh metadata for data source"""
     try:
         source = DataSource.query.get_or_404(source_id)
-        data_source_manager.refresh__metadata(source)
-        return jsonify({'message': '_metadata refreshed successfully'})
+        data_source_manager.refresh_metadata(source)
+        return jsonify({'message': 'Metadata refreshed successfully'})
     except Exception as e:
-        logger.error(f"Error refreshing _metadata: {str(e)}")
+        logger.error(f"Error refreshing metadata: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/data-sources/<int:source_id>/sample', methods=['GET'])
@@ -180,26 +188,44 @@ def get_sample_data(source_id):
     """Get sample data from source"""
     try:
         source = DataSource.query.get_or_404(source_id)
-        sample = data_source_manager.get_sample_data(source)
+        table_name = request.args.get('table')
+        limit = int(request.args.get('limit', 100))
+        
+        sample = data_source_manager.get_sample_data(source, table_name, limit)
         return jsonify(sample)
     except Exception as e:
         logger.error(f"Error getting sample data: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/data-sources/<int:source_id>/stats', methods=['GET'])
+def get_source_statistics(source_id):
+    """Get comprehensive statistics for a data source"""
+    try:
+        stats = data_source_manager.get_source_statistics(source_id)
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"Error getting source statistics: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/data-sources/<int:source_id>', methods=['DELETE'])
+def delete_data_source(source_id):
+    """Delete a data source"""
+    try:
+        data_source_manager.delete_source(source_id)
+        return jsonify({'message': 'Data source deleted successfully'})
+    except Exception as e:
+        logger.error(f"Error deleting data source: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/dictionary', methods=['GET'])
 def get_dictionary():
     """Get all dictionary entries"""
-    entries = DictionaryEntry.query.all()
-    return jsonify([{
-        'id': e.id,
-        'term': e.term,
-        'definition': e.definition,
-        'category': e.category,
-        'synonyms': e.synonyms,
-        'approved': e.approved,
-        'created_at': e.created_at.isoformat(),
-        'updated_at': e.updated_at.isoformat()
-    } for e in entries])
+    try:
+        entries = DictionaryEntry.query.all()
+        return jsonify([entry.to_dict() for entry in entries])
+    except Exception as e:
+        logger.error(f"Error getting dictionary entries: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/dictionary', methods=['POST'])
 def create_dictionary_entry():
@@ -282,13 +308,12 @@ def get_embedding_status(job_id):
 @app.route('/api/chat/sessions', methods=['GET'])
 def get_chat_sessions():
     """Get chat sessions"""
-    sessions = ChatSession.query.order_by(ChatSession.created_at.desc()).all()
-    return jsonify([{
-        'id': s.id,
-        'title': s.title,
-        'created_at': s.created_at.isoformat(),
-        'updated_at': s.updated_at.isoformat()
-    } for s in sessions])
+    try:
+        sessions = chat_service.get_sessions(limit=50)
+        return jsonify([session.to_dict() for session in sessions])
+    except Exception as e:
+        logger.error(f"Error getting chat sessions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/chat/sessions', methods=['POST'])
 def create_chat_session():
@@ -304,14 +329,24 @@ def create_chat_session():
 @app.route('/api/chat/sessions/<int:session_id>/messages', methods=['GET'])
 def get_chat_messages(session_id):
     """Get messages for chat session"""
-    messages = ChatMessage.query.filter_by(session_id=session_id).order_by(ChatMessage.created_at.asc()).all()
-    return jsonify([{
-        'id': m.id,
-        'role': m.role,
-        'content': m.content,
-        '_metadata': m._metadata,
-        'created_at': m.created_at.isoformat()
-    } for m in messages])
+    try:
+        messages = chat_service.get_messages(session_id)
+        return jsonify([message.to_dict() for message in messages])
+    except Exception as e:
+        logger.error(f"Error getting chat messages: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/chat/sessions/<int:session_id>', methods=['GET'])
+def get_chat_session(session_id):
+    """Get a specific chat session"""
+    try:
+        session = chat_service.get_session(session_id)
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+        return jsonify(session.to_dict())
+    except Exception as e:
+        logger.error(f"Error getting chat session: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/chat/sessions/<int:session_id>', methods=['DELETE'])
 def delete_chat_session(session_id):
@@ -377,13 +412,38 @@ def execute_sql():
 def get_system_health():
     """Get system health metrics"""
     try:
-        # Basic health check
+        # Check database connection
+        db_healthy = True
+        try:
+            db.session.execute('SELECT 1')
+        except:
+            db_healthy = False
+        
+        # Check LLM service
+        llm_healthy = True
+        try:
+            from services.llm_client import LLMClient
+            llm_client = LLMClient()
+            test_result = llm_client.test_connection()
+            llm_healthy = test_result.get('status') == 'success'
+        except:
+            llm_healthy = False
+        
+        # Check embedding service
+        embedding_healthy = True
+        try:
+            # Simple check - this could be more sophisticated
+            embedding_service.get_available_indexes()
+        except:
+            embedding_healthy = False
+        
         health = {
-            'database': 'healthy',
-            'embedding_service': 'healthy',
-            'llm_service': 'healthy',
+            'database': 'healthy' if db_healthy else 'error',
+            'llm_service': 'healthy' if llm_healthy else 'error',
+            'embedding_service': 'healthy' if embedding_healthy else 'error',
             'timestamp': datetime.utcnow().isoformat()
         }
+        
         return jsonify(health)
     except Exception as e:
         logger.error(f"Error getting system health: {str(e)}")
@@ -410,19 +470,12 @@ def get_system_stats():
 def export_dictionary():
     """Export dictionary as JSON"""
     try:
-        entries = DictionaryEntry.query.all()
-        data = [{
-            'term': e.term,
-            'definition': e.definition,
-            'category': e.category,
-            'synonyms': e.synonyms,
-            'approved': e.approved
-        } for e in entries]
+        entries = dictionary_service.export_dictionary()
         
         # Save to temporary file
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(data, f, indent=2)
+            json.dump(entries, f, indent=2)
             temp_path = f.name
         
         return send_file(temp_path, as_attachment=True, download_name='dictionary.json')
@@ -437,8 +490,11 @@ def import_dictionary():
         file = request.files['file']
         if file and file.filename.endswith('.json'):
             data = json.load(file)
-            dictionary_service.import_dictionary(data)
-            return jsonify({'message': 'Dictionary imported successfully'})
+            result = dictionary_service.import_dictionary(data)
+            return jsonify({
+                'message': 'Dictionary imported successfully',
+                'stats': result
+            })
         else:
             return jsonify({'error': 'Invalid file format'}), 400
     except Exception as e:
@@ -457,7 +513,12 @@ def internal_error(error):
 # Initialize database
 @app.before_request
 def create_tables():
-    db.create_all()
+    """Create database tables if they don't exist"""
+    try:
+        db.create_all()
+        logger.info("Database tables created/verified")
+    except Exception as e:
+        logger.error(f"Error creating database tables: {str(e)}")
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5555)

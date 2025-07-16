@@ -1,7 +1,0 @@
-order_id,customer_id,product_name,order_amount,order_date,status
-101,1,Laptop,999.99,2024-03-01,Completed
-102,2,Mouse,29.99,2024-03-02,Completed
-103,1,Keyboard,79.99,2024-03-05,Pending
-104,3,Monitor,299.99,2024-03-07,Completed
-105,2,Headphones,199.99,2024-03-10,Shipped
-106,4,Webcam,89.99,2024-03-12,Completed
