@@ -89,7 +89,7 @@
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <form id="dataSourceForm">
+                <form id="dataSourceForm" enctype="multipart/form-data">
                     <input type="hidden" id="editSourceId">
                     
                     <div class="row">
@@ -119,26 +119,7 @@
                     <div id="fileUploadSection" style="display: none;">
                         <div class="mb-3">
                             <label class="form-label">File</label>
-                            <div class="file-upload-area" id="fileUploadArea">
-                                <div class="text-center">
-                                    <i class="fas fa-cloud-upload-alt fa-3x text-muted mb-2"></i>
-                                    <p class="mb-1">Click to upload or drag and drop</p>
-                                    <small class="text-muted">Supports CSV, Excel files (max 100MB)</small>
-                                </div>
-                                <input type="file" id="sourceFile" accept=".csv,.xlsx,.xls" style="display: none;">
-                            </div>
-                            <div id="fileInfo" class="mt-2" style="display: none;">
-                                <div class="alert alert-info d-flex align-items-center">
-                                    <i class="fas fa-file me-2"></i>
-                                    <div>
-                                        <strong id="fileName"></strong><br>
-                                        <small id="fileSize"></small>
-                                    </div>
-                                    <button type="button" class="btn btn-sm btn-outline-danger ms-auto" onclick="clearFile()">
-                                        <i class="fas fa-times"></i>
-                                    </button>
-                                </div>
-                            </div>
+                            <input type="file" class="form-control" id="sourceFile" name="file" accept=".csv,.xlsx,.xls">
                         </div>
                     </div>
 
@@ -179,7 +160,7 @@
                         <div class="mb-3">
                             <label class="form-label">Connection String (advanced)</label>
                             <textarea class="form-control" id="connectionString" rows="2" 
-                                     placeholder="Leave empty to auto-generate from fields above"></textarea>
+                                    placeholder="Leave empty to auto-generate from fields above"></textarea>
                             <small class="text-muted">If provided, this will override the individual fields above</small>
                         </div>
                     </div>
@@ -187,7 +168,7 @@
                     <div class="mb-3">
                         <label class="form-label">Description</label>
                         <textarea class="form-control" id="sourceDescription" rows="2" 
-                                 placeholder="Optional description of this data source"></textarea>
+                                placeholder="Optional description of this data source"></textarea>
                     </div>
                 </form>
             </div>
@@ -597,36 +578,40 @@ async function saveDataSource() {
         const saveBtn = event.target;
         showLoading(saveBtn);
         
-        const data = {
-            name: sourceName,
-            type: sourceType,
-            _metadata: {
-                description: document.getElementById('sourceDescription').value
-            }
-        };
+        // Create FormData for file upload
+        const formData = new FormData();
+        formData.append('name', sourceName);
+        formData.append('type', sourceType);
+        formData.append('description', document.getElementById('sourceDescription').value);
         
-        // Add connection details
         if (sourceType === 'csv' || sourceType === 'excel') {
             const file = document.getElementById('sourceFile').files[0];
             if (!file) {
                 showToast('Please select a file', 'warning');
+                hideLoading(saveBtn);
                 return;
             }
-            // In a real implementation, you'd upload the file first
-            data.file_path = `/uploads/${file.name}`;
+            formData.append('file', file);
         } else {
-            const connectionData = buildConnectionData();
-            data.connection_string = connectionData.connection_string;
+            const connectionString = document.getElementById('connectionString').value ||
+                buildConnectionString();
+            formData.append('connection_string', connectionString);
         }
         
         const editId = document.getElementById('editSourceId').value;
         const method = editId ? 'PUT' : 'POST';
         const url = editId ? `/api/data-sources/${editId}` : '/api/data-sources';
         
-        const result = await apiRequest(url, {
+        const response = await fetch(url, {
             method: method,
-            body: JSON.stringify(data)
+            body: formData
         });
+        
+        const result = await response.json();
+        
+        if (!response.ok) {
+            throw new Error(result.error || 'Request failed');
+        }
         
         showToast(editId ? 'Data source updated successfully' : 'Data source added successfully', 'success');
         
@@ -641,6 +626,22 @@ async function saveDataSource() {
         hideLoading(event.target);
     }
 }
+
+function buildConnectionString() {
+    const sourceType = document.getElementById('sourceType').value;
+    const host = document.getElementById('dbHost').value;
+    const port = document.getElementById('dbPort').value;
+    const database = document.getElementById('dbName').value;
+    const username = document.getElementById('dbUsername').value;
+    const password = document.getElementById('dbPassword').value;
+    
+    if (!host || !database) {
+        throw new Error('Host and database are required');
+    }
+    
+    return `${sourceType}://${username}:${password}@${host}:${port}/${database}`;
+}
+
 
 async function showSourceDetails(sourceId) {
     currentSourceId = sourceId;

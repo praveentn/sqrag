@@ -20,6 +20,9 @@ from config import Config
 app = Flask(__name__)
 app.config.from_object(Config)
 
+app.config['UPLOAD_FOLDER'] = Config.UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = Config.MAX_CONTENT_LENGTH
+
 # Initialize extensions
 db.init_app(app)
 migrate = Migrate(app, db)
@@ -85,19 +88,67 @@ def get_data_sources():
         'last_refresh': s.last_refresh.isoformat() if s.last_refresh else None
     } for s in sources])
 
+# app.py - Update the create_data_source route
 @app.route('/api/data-sources', methods=['POST'])
 def create_data_source():
     """Create new data source"""
     try:
-        data = request.get_json()
+        # Ensure upload directory exists
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+        
+        # Handle both JSON and form data
+        if request.content_type and 'multipart/form-data' in request.content_type:
+            # File upload case
+            data = {}
+            data['name'] = request.form.get('name')
+            data['type'] = request.form.get('type')
+            data['description'] = request.form.get('description', '')
+            
+            # Handle file upload
+            if 'file' in request.files:
+                file = request.files['file']
+                if file and file.filename:
+                    # Save file with secure filename
+                    import uuid
+                    from werkzeug.utils import secure_filename
+                    
+                    filename = secure_filename(file.filename)
+                    unique_filename = f"{uuid.uuid4().hex}_{filename}"
+                    file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+                    
+                    # Save the file
+                    file.save(file_path)
+                    data['file_path'] = file_path
+                    
+                    logger.info(f"File saved: {file_path}")
+            
+            # Handle database connection
+            if data['type'] not in ['csv', 'excel']:
+                data['connection_string'] = request.form.get('connection_string', '')
+        else:
+            # JSON case
+            data = request.get_json()
+        
+        # Validate required fields
+        if not data.get('name') or not data.get('type'):
+            return jsonify({'error': 'Name and type are required'}), 400
+        
+        # Create data source
         source = data_source_manager.create_source(
             name=data['name'],
             type=data['type'],
             connection_string=data.get('connection_string', ''),
             file_path=data.get('file_path', ''),
-            _metadata=data.get('_metadata', {})
+            metadata={'description': data.get('description', '')}
         )
-        return jsonify({'id': source.id, 'message': 'Data source created successfully'})
+        
+        logger.info(f"Created data source: {source.name}")
+        return jsonify({
+            'id': source.id, 
+            'message': 'Data source created successfully',
+            'source': source.to_dict()
+        })
+        
     except Exception as e:
         logger.error(f"Error creating data source: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -192,8 +243,13 @@ def delete_dictionary_entry(entry_id):
 def generate_dictionary():
     """Auto-generate dictionary from data sources"""
     try:
-        dictionary_service.auto_generate_dictionary()
-        return jsonify({'message': 'Dictionary generated successfully'})
+        result = dictionary_service.auto_generate_dictionary()
+        return jsonify({
+            'message': 'Dictionary generated successfully',
+            'terms_generated': result.get('terms_generated', 0),
+            'tables_processed': result.get('tables_processed', 0),
+            'columns_processed': result.get('columns_processed', 0)
+        })
     except Exception as e:
         logger.error(f"Error generating dictionary: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -256,6 +312,19 @@ def get_chat_messages(session_id):
         '_metadata': m._metadata,
         'created_at': m.created_at.isoformat()
     } for m in messages])
+
+@app.route('/api/chat/sessions/<int:session_id>', methods=['DELETE'])
+def delete_chat_session(session_id):
+    """Delete a chat session"""
+    try:
+        result = chat_service.delete_session(session_id)
+        if result:
+            return jsonify({'message': 'Chat session deleted successfully'})
+        else:
+            return jsonify({'error': 'Session not found'}), 404
+    except Exception as e:
+        logger.error(f"Error deleting chat session: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/chat/query', methods=['POST'])
 def process_query():

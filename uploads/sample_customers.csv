@@ -1,6 +1,6 @@
-customer_id,customer_name,email,city,country,signup_date,total_orders,total_spent
-1,John Doe,john.doe@email.com,New York,USA,2023-01-15,12,1250.00
-2,Jane Smith,jane.smith@email.com,London,UK,2023-02-20,8,890.50
-3,Bob Johnson,bob.johnson@email.com,Toronto,Canada,2023-03-10,15,2100.75
-4,Alice Brown,alice.brown@email.com,Sydney,Australia,2023-01-05,6,450.25
-5,Charlie Wilson,charlie.wilson@email.com,Berlin,Germany,2023-04-12,20,3200.00
+customer_id,customer_name,email,city,signup_date
+1,John Doe,john@example.com,New York,2024-01-15
+2,Jane Smith,jane@example.com,Los Angeles,2024-01-20
+3,Bob Johnson,bob@example.com,Chicago,2024-02-01
+4,Alice Brown,alice@example.com,Houston,2024-02-10
+5,Charlie Wilson,charlie@example.com,Phoenix,2024-02-15

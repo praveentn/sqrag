@@ -2,6 +2,10 @@
 import os
 import yaml
 from pathlib import Path
+from dotenv import load_dotenv  # Add this import
+
+# Load environment variables from .env file
+load_dotenv()
 
 class Config:
     """Application configuration"""
@@ -26,7 +30,7 @@ class Config:
     LLM_CONFIG = {
         'provider': os.environ.get('LLM_PROVIDER', 'azure_openai'),
         'azure': {
-            'endpoint': os.environ.get('AZURE_OPENAI_ENDPOINT', 'https://your-endpoint.openai.azure.com/'),
+            'endpoint': os.environ.get('AZURE_OPENAI_ENDPOINT', ''),
             'api_key': os.environ.get('AZURE_OPENAI_API_KEY', ''),
             'api_version': os.environ.get('AZURE_OPENAI_API_VERSION', '2024-12-01-preview'),
             'deployment_name': os.environ.get('AZURE_OPENAI_DEPLOYMENT', 'gpt-4'),
