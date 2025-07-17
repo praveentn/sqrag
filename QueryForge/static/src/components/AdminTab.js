@@ -19,7 +19,7 @@ import {
   BarChart3,
   Cpu,
   HardDrive,
-  // Memory,
+  MemoryStick, // Replaced Memory with MemoryStick
   Network,
   Server,
   Eye, X
@@ -191,7 +191,7 @@ const SystemOverview = ({ systemHealth, onRefresh }) => {
 
         <div className="bg-white p-6 rounded-lg border border-gray-200">
           <div className="flex items-center">
-            <Memory className="h-8 w-8 text-green-500" />
+            <MemoryStick className="h-8 w-8 text-green-500" />
             <div className="ml-4">
               <p className="text-sm font-medium text-gray-500">Memory Usage</p>
               <p className="text-2xl font-semibold text-gray-900">
@@ -642,7 +642,7 @@ const SystemMonitoring = ({ systemHealth, onRefresh }) => {
                 {systemHealth?.system?.memory?.usage_percent?.toFixed(1) || 0}%
               </p>
             </div>
-            <Memory className="h-8 w-8 text-green-500" />
+            <MemoryStick className="h-8 w-8 text-green-500" />
           </div>
           <div className="mt-4 w-full bg-gray-200 rounded-full h-2">
             <div 

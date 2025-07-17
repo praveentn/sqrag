@@ -14,7 +14,11 @@ import {
   Users,
   CheckCircle,
   Clock,
-  AlertTriangle, X
+  AlertTriangle, 
+  X,
+  Check,
+  ThumbsUp,
+  ThumbsDown
 } from 'lucide-react';
 import LoadingSpinner, { LoadingButton, SkeletonLoader } from './LoadingSpinner';
 import SuggestionsModal from './SuggestionsModal';
@@ -64,9 +68,35 @@ const DictionaryTab = ({ projectId, apiUrl, onNotification }) => {
       if (!response.ok) throw new Error('Failed to generate suggestions');
       
       const data = await response.json();
-      setSuggestions(Array.isArray(data.suggestions) ? data.suggestions : []);
+      
+      // Process suggestions into a flat array
+      const allSuggestions = [];
+      
+      // Add business terms
+      if (data.suggestions.business_terms) {
+        allSuggestions.push(...data.suggestions.business_terms);
+      }
+      
+      // Add technical terms
+      if (data.suggestions.technical_terms) {
+        allSuggestions.push(...data.suggestions.technical_terms);
+      }
+      
+      // Add abbreviations
+      if (data.suggestions.abbreviations) {
+        allSuggestions.push(...data.suggestions.abbreviations);
+      }
+      
+      // Add domain terms
+      if (data.suggestions.domain_terms) {
+        Object.values(data.suggestions.domain_terms).forEach(domainTerms => {
+          allSuggestions.push(...domainTerms);
+        });
+      }
+      
+      setSuggestions(allSuggestions);
       setShowSuggestionsModal(true);
-      onNotification(`Generated ${data.auto_generated_count} suggestions`, 'success');
+      onNotification(`Generated ${allSuggestions.length} suggestions`, 'success');
     } catch (error) {
       onNotification('Error generating suggestions: ' + error.message, 'error');
     } finally {
@@ -129,6 +159,40 @@ const DictionaryTab = ({ projectId, apiUrl, onNotification }) => {
       fetchDictionaryEntries();
     } catch (error) {
       onNotification('Error deleting entry: ' + error.message, 'error');
+    }
+  };
+
+  const approveEntry = async (entryId) => {
+    try {
+      const response = await fetch(`${apiUrl}/dictionary/${entryId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'approved' })
+      });
+
+      if (!response.ok) throw new Error('Failed to approve entry');
+      
+      onNotification('Dictionary entry approved', 'success');
+      fetchDictionaryEntries();
+    } catch (error) {
+      onNotification('Error approving entry: ' + error.message, 'error');
+    }
+  };
+
+  const rejectEntry = async (entryId) => {
+    try {
+      const response = await fetch(`${apiUrl}/dictionary/${entryId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: 'rejected' })
+      });
+
+      if (!response.ok) throw new Error('Failed to reject entry');
+      
+      onNotification('Dictionary entry rejected', 'success');
+      fetchDictionaryEntries();
+    } catch (error) {
+      onNotification('Error rejecting entry: ' + error.message, 'error');
     }
   };
 
@@ -331,6 +395,8 @@ const DictionaryTab = ({ projectId, apiUrl, onNotification }) => {
                 setShowEditModal(true);
               }}
               onDelete={() => deleteEntry(entry.id, entry.term)}
+              onApprove={() => approveEntry(entry.id)}
+              onReject={() => rejectEntry(entry.id)}
             />
           ))}
         </div>
@@ -364,7 +430,7 @@ const DictionaryTab = ({ projectId, apiUrl, onNotification }) => {
           suggestions={suggestions}
           onClose={() => {
             setShowSuggestionsModal(false);
-            setSuggestions(null);
+            setSuggestions([]);
           }}
           onCreateEntries={async (selectedSuggestions) => {
             // Create entries in bulk
@@ -374,12 +440,12 @@ const DictionaryTab = ({ projectId, apiUrl, onNotification }) => {
                 definition: suggestion.enhanced_definition || suggestion.auto_definition,
                 category: suggestion.category || 'business_term',
                 domain: suggestion.suggested_domain,
-                synonyms: suggestion.suggested_synonyms || []
+                synonyms: suggestion.suggested_synonyms || [],
+                status: 'draft'
               });
             }
             setShowSuggestionsModal(false);
-            setSuggestions(null);
-            fetchDictionaryEntries();
+            setSuggestions([]);
           }}
         />
       )}
@@ -388,13 +454,15 @@ const DictionaryTab = ({ projectId, apiUrl, onNotification }) => {
 };
 
 // Dictionary Entry Card Component
-const DictionaryEntryCard = ({ entry, onEdit, onDelete }) => {
+const DictionaryEntryCard = ({ entry, onEdit, onDelete, onApprove, onReject }) => {
   const getStatusColor = (status) => {
     switch (status) {
       case 'approved':
         return 'bg-green-100 text-green-800';
       case 'draft':
         return 'bg-yellow-100 text-yellow-800';
+      case 'rejected':
+        return 'bg-red-100 text-red-800';
       case 'archived':
         return 'bg-gray-100 text-gray-800';
       default:
@@ -414,6 +482,8 @@ const DictionaryEntryCard = ({ entry, onEdit, onDelete }) => {
         return 'bg-gray-100 text-gray-800';
     }
   };
+
+  const showApprovalButtons = entry.status === 'draft' || entry.status === 'rejected';
 
   return (
     <div className="bg-white border border-gray-200 rounded-lg p-6 hover:shadow-md transition-shadow">
@@ -461,15 +531,35 @@ const DictionaryEntryCard = ({ entry, onEdit, onDelete }) => {
         </div>
         
         <div className="flex items-center space-x-2 ml-4">
+          {showApprovalButtons && (
+            <>
+              <button
+                onClick={onApprove}
+                className="p-2 text-green-600 hover:text-green-800 rounded-full hover:bg-green-50"
+                title="Approve"
+              >
+                <ThumbsUp className="h-4 w-4" />
+              </button>
+              <button
+                onClick={onReject}
+                className="p-2 text-red-600 hover:text-red-800 rounded-full hover:bg-red-50"
+                title="Reject"
+              >
+                <ThumbsDown className="h-4 w-4" />
+              </button>
+            </>
+          )}
           <button
             onClick={onEdit}
             className="p-2 text-gray-400 hover:text-gray-600 rounded-full hover:bg-gray-100"
+            title="Edit"
           >
             <Edit3 className="h-4 w-4" />
           </button>
           <button
             onClick={onDelete}
             className="p-2 text-gray-400 hover:text-red-600 rounded-full hover:bg-red-50"
+            title="Delete"
           >
             <Trash2 className="h-4 w-4" />
           </button>
@@ -487,7 +577,8 @@ const DictionaryEntryModal = ({ title, entry, onSubmit, onCancel }) => {
     category: entry?.category || 'business_term',
     domain: entry?.domain || '',
     synonyms: entry?.synonyms?.join(', ') || '',
-    abbreviations: entry?.abbreviations?.join(', ') || ''
+    abbreviations: entry?.abbreviations?.join(', ') || '',
+    status: entry?.status || 'draft'
   });
   const [loading, setLoading] = useState(false);
   const [errors, setErrors] = useState({});
@@ -576,15 +667,29 @@ const DictionaryEntryModal = ({ title, entry, onSubmit, onCancel }) => {
                   </div>
 
                   <div>
-                    <label className="form-label">Domain</label>
-                    <input
-                      type="text"
-                      value={formData.domain}
-                      onChange={(e) => setFormData({ ...formData, domain: e.target.value })}
-                      className="form-input"
-                      placeholder="e.g., finance, hr"
-                    />
+                    <label className="form-label">Status</label>
+                    <select
+                      value={formData.status}
+                      onChange={(e) => setFormData({ ...formData, status: e.target.value })}
+                      className="form-select"
+                    >
+                      <option value="draft">Draft</option>
+                      <option value="approved">Approved</option>
+                      <option value="rejected">Rejected</option>
+                      <option value="archived">Archived</option>
+                    </select>
                   </div>
+                </div>
+
+                <div>
+                  <label className="form-label">Domain</label>
+                  <input
+                    type="text"
+                    value={formData.domain}
+                    onChange={(e) => setFormData({ ...formData, domain: e.target.value })}
+                    className="form-input"
+                    placeholder="e.g., finance, hr"
+                  />
                 </div>
 
                 <div>
@@ -634,7 +739,5 @@ const DictionaryEntryModal = ({ title, entry, onSubmit, onCancel }) => {
     </div>
   );
 };
-
-
 
 export default DictionaryTab;

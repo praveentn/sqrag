@@ -33,7 +33,8 @@ logger = logging.getLogger(__name__)
 class EmbeddingService:
     """Service for creating and managing embeddings and search indexes"""
     
-    def __init__(self):
+    def __init__(self, app=None):
+        self.app = app
         self.embedding_models = {}
         self.indexes = {}
         self.job_status = {}  # Track async jobs
@@ -75,14 +76,6 @@ class EmbeddingService:
         """Create embeddings in batch for multiple object types"""
         job_id = str(uuid.uuid4())
         
-        # Start background job
-        thread = threading.Thread(
-            target=self._run_embedding_job,
-            args=(job_id, project_id, model_name, object_types)
-        )
-        thread.daemon = True
-        thread.start()
-        
         # Track job status
         self.job_status[job_id] = {
             'status': 'running',
@@ -93,7 +86,28 @@ class EmbeddingService:
             'started_at': datetime.utcnow()
         }
         
+        # Start background job with proper Flask context
+        if self.app:
+            thread = threading.Thread(
+                target=self._run_embedding_job_with_context,
+                args=(job_id, project_id, model_name, object_types)
+            )
+        else:
+            thread = threading.Thread(
+                target=self._run_embedding_job,
+                args=(job_id, project_id, model_name, object_types)
+            )
+        
+        thread.daemon = True
+        thread.start()
+        
         return job_id
+    
+    def _run_embedding_job_with_context(self, job_id: str, project_id: int, 
+                                      model_name: str, object_types: List[str]):
+        """Run embedding job with Flask application context"""
+        with self.app.app_context():
+            self._run_embedding_job(job_id, project_id, model_name, object_types)
     
     def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Get status of embedding job"""
@@ -116,6 +130,15 @@ class EmbeddingService:
                 'total_objects': total_objects,
                 'message': f'Processing {total_objects} objects'
             })
+            
+            if total_objects == 0:
+                self.job_status[job_id].update({
+                    'status': 'completed',
+                    'progress': 1.0,
+                    'message': 'No objects found to embed',
+                    'completed_at': datetime.utcnow()
+                })
+                return
             
             created_count = 0
             batch_size = Config.EMBEDDING_CONFIG['batch_size']
@@ -145,7 +168,12 @@ class EmbeddingService:
                 })
                 
                 # Commit batch
-                db.session.commit()
+                try:
+                    db.session.commit()
+                except Exception as e:
+                    logger.error(f"Error committing embeddings batch: {str(e)}")
+                    db.session.rollback()
+                    raise
             
             # Job completed
             self.job_status[job_id].update({
@@ -163,7 +191,10 @@ class EmbeddingService:
                 'error': str(e),
                 'failed_at': datetime.utcnow()
             })
-            db.session.rollback()
+            try:
+                db.session.rollback()
+            except:
+                pass  # Session might not be available
     
     def _get_objects_for_embedding(self, project_id: int, object_types: List[str]) -> List[Dict]:
         """Get all objects that need embeddings"""
@@ -314,7 +345,7 @@ class EmbeddingService:
                 'model_name': model_name,
                 'vector_dimension': len(vector),
                 'vector': pickle.dumps(vector),  # Serialize vector
-                'vector_norm': float(np.linalg.norm(vector))
+                'vector_norm': round(float(np.linalg.norm(vector)), 3)
             }
             embeddings.append(embedding_data)
         
@@ -414,8 +445,9 @@ class EmbeddingService:
             logger.error(f"Error building index {index_id}: {str(e)}")
             
             # Update error status
-            index_record.status = 'error'
-            db.session.commit()
+            if index_record:
+                index_record.status = 'error'
+                db.session.commit()
             
             raise Exception(f"Index building failed: {str(e)}")
     
@@ -437,19 +469,23 @@ class EmbeddingService:
         # Convert to dict format with deserialized vectors
         embedding_data = []
         for emb in embeddings:
-            vector = pickle.loads(emb.vector)
-            embedding_data.append({
-                'id': emb.id,
-                'object_type': emb.object_type,
-                'object_id': emb.object_id,
-                'object_text': emb.object_text,
-                'vector': vector,
-                'metadata': {
-                    'model_name': emb.model_name,
-                    'vector_dimension': emb.vector_dimension,
-                    'vector_norm': emb.vector_norm
-                }
-            })
+            try:
+                vector = pickle.loads(emb.vector)
+                embedding_data.append({
+                    'id': emb.id,
+                    'object_type': emb.object_type,
+                    'object_id': emb.object_id,
+                    'object_text': emb.object_text,
+                    'vector': vector,
+                    'metadata': {
+                        'model_name': emb.model_name,
+                        'vector_dimension': emb.vector_dimension,
+                        'vector_norm': emb.vector_norm
+                    }
+                })
+            except Exception as e:
+                logger.warning(f"Error deserializing embedding {emb.id}: {str(e)}")
+                continue
         
         return embedding_data
     

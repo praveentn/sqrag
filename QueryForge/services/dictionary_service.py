@@ -2,14 +2,13 @@
 import re
 import json
 import logging
-from typing import Dict, List, Any, Optional, Set
-from collections import Counter
-from datetime import datetime
+from typing import Dict, List, Any, Optional, Set, Tuple
+from collections import Counter, defaultdict
 import openai
 from openai import AzureOpenAI
 
 from config import Config
-from models import db, Project, Table, Column, DictionaryEntry
+from models import db, Project, Table, Column, DictionaryEntry, DataSource
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +17,11 @@ class DictionaryService:
     
     def __init__(self):
         self._init_llm_client()
-        self.common_words = self._load_common_words()
+        self.common_abbreviations = self._load_common_abbreviations()
+        self.business_keywords = self._load_business_keywords()
         
     def _init_llm_client(self):
-        """Initialize Azure OpenAI client for term generation"""
+        """Initialize Azure OpenAI client"""
         try:
             llm_config = Config.LLM_CONFIG['azure']
             self.client = AzureOpenAI(
@@ -30,593 +30,547 @@ class DictionaryService:
                 azure_endpoint=llm_config['endpoint']
             )
             self.deployment_name = llm_config['deployment_name']
+            logger.info("Azure OpenAI client initialized for dictionary service")
         except Exception as e:
             logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}")
             self.client = None
     
     def generate_suggestions(self, project_id: int) -> Dict[str, Any]:
-        """Generate dictionary suggestions from project data"""
+        """Generate comprehensive dictionary suggestions for a project"""
         try:
             project = Project.query.get(project_id)
             if not project:
                 raise ValueError(f"Project {project_id} not found")
             
+            # Collect all textual data from the project
+            project_data = self._collect_project_data(project_id)
+            
             suggestions = {
                 'business_terms': [],
-                'technical_terms': [], 
+                'technical_terms': [],
                 'abbreviations': [],
-                'domain_terms': {},
-                'auto_generated_count': 0
+                'domain_terms': {}
             }
             
-            # Analyze table and column names
-            table_suggestions = self._analyze_table_names(project)
-            column_suggestions = self._analyze_column_names(project)
-            value_suggestions = self._analyze_sample_values(project)
+            # Generate different types of suggestions
+            suggestions['business_terms'] = self._generate_business_terms(project_data)
+            suggestions['technical_terms'] = self._generate_technical_terms(project_data)
+            suggestions['abbreviations'] = self._generate_abbreviations(project_data)
+            suggestions['domain_terms'] = self._generate_domain_terms(project_data)
             
-            # Combine and categorize suggestions
-            all_terms = table_suggestions + column_suggestions + value_suggestions
-            categorized = self._categorize_terms(all_terms)
-            
-            suggestions.update(categorized)
-            suggestions['auto_generated_count'] = len(all_terms)
-            
-            # Use LLM to enhance definitions if available
+            # Enhance suggestions with AI if available
             if self.client:
-                suggestions = self._enhance_with_llm(suggestions, project)
+                suggestions = self._enhance_suggestions_with_ai(suggestions, project_data)
             
+            # Filter and rank suggestions
+            suggestions = self._filter_and_rank_suggestions(suggestions, project_id)
+            
+            logger.info(f"Generated {self._count_suggestions(suggestions)} suggestions for project {project_id}")
             return suggestions
             
         except Exception as e:
             logger.error(f"Error generating dictionary suggestions: {str(e)}")
-            raise
+            return {
+                'business_terms': [],
+                'technical_terms': [],
+                'abbreviations': [],
+                'domain_terms': {},
+                'error': str(e)
+            }
     
-    def _analyze_table_names(self, project: Project) -> List[Dict[str, Any]]:
-        """Analyze table names to extract business terms"""
+    def _collect_project_data(self, project_id: int) -> Dict[str, Any]:
+        """Collect all relevant textual data from the project"""
+        try:
+            # Get tables and columns
+            tables = db.session.query(Table).join(DataSource).filter(
+                DataSource.project_id == project_id
+            ).all()
+            
+            columns = db.session.query(Column).join(Table).join(DataSource).filter(
+                DataSource.project_id == project_id
+            ).all()
+            
+            # Collect existing dictionary terms
+            existing_terms = DictionaryEntry.query.filter_by(
+                project_id=project_id
+            ).all()
+            
+            data = {
+                'table_names': [table.name for table in tables],
+                'table_display_names': [table.display_name for table in tables if table.display_name],
+                'table_descriptions': [table.description for table in tables if table.description],
+                'column_names': [col.name for col in columns],
+                'column_display_names': [col.display_name for col in columns if col.display_name],
+                'column_descriptions': [col.description for col in columns if col.description],
+                'business_categories': [col.business_category for col in columns if col.business_category],
+                'sample_values': [],
+                'existing_terms': [term.term for term in existing_terms],
+                'data_types': list(set(col.data_type for col in columns if col.data_type))
+            }
+            
+            # Collect sample values
+            for col in columns:
+                if col.sample_values:
+                    data['sample_values'].extend([str(val) for val in col.sample_values[:3]])
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Error collecting project data: {str(e)}")
+            return {}
+    
+    def _generate_business_terms(self, project_data: Dict) -> List[Dict[str, Any]]:
+        """Generate business term suggestions"""
         suggestions = []
         
-        for source in project.sources:
-            for table in source.tables:
-                # Clean table name
-                cleaned_name = self._clean_identifier(table.name)
-                terms = self._extract_terms_from_name(cleaned_name)
-                
-                for term in terms:
-                    if self._is_meaningful_term(term):
-                        suggestion = {
-                            'term': term,
-                            'category': 'business_term',
-                            'source_type': 'table',
-                            'source_name': table.name,
-                            'confidence': 0.8,
-                            'auto_definition': f"Business entity representing {term} data",
-                            'context': {
-                                'table_name': table.name,
-                                'row_count': table.row_count,
-                                'source_id': source.id
-                            }
-                        }
-                        suggestions.append(suggestion)
+        # Extract business terms from table names
+        for table_name in project_data.get('table_names', []):
+            terms = self._extract_business_terms_from_text(table_name)
+            for term in terms:
+                suggestions.append({
+                    'term': term,
+                    'auto_definition': f'Business entity or concept related to {table_name}',
+                    'category': 'business_term',
+                    'confidence': 0.7,
+                    'context': f'Derived from table: {table_name}',
+                    'suggested_domain': self._infer_domain(table_name),
+                    'suggested_synonyms': self._find_synonyms(term)
+                })
         
-        return suggestions
+        # Extract from column names
+        for col_name in project_data.get('column_names', []):
+            terms = self._extract_business_terms_from_text(col_name)
+            for term in terms:
+                suggestions.append({
+                    'term': term,
+                    'auto_definition': f'Data attribute or field representing {term}',
+                    'category': 'business_term',
+                    'confidence': 0.6,
+                    'context': f'Derived from column: {col_name}',
+                    'suggested_domain': self._infer_domain(col_name),
+                    'suggested_synonyms': self._find_synonyms(term)
+                })
+        
+        # Extract from business categories
+        for category in project_data.get('business_categories', []):
+            if category:
+                suggestions.append({
+                    'term': category.replace('_', ' ').title(),
+                    'auto_definition': f'Business category or classification',
+                    'category': 'business_term',
+                    'confidence': 0.8,
+                    'context': f'Business category: {category}',
+                    'suggested_domain': category,
+                    'suggested_synonyms': []
+                })
+        
+        return self._deduplicate_suggestions(suggestions)
     
-    def _analyze_column_names(self, project: Project) -> List[Dict[str, Any]]:
-        """Analyze column names to extract technical and business terms"""
-        suggestions = []
-        column_patterns = self._build_column_patterns()
-        
-        for source in project.sources:
-            for table in source.tables:
-                for column in table.columns:
-                    # Clean column name
-                    cleaned_name = self._clean_identifier(column.name)
-                    terms = self._extract_terms_from_name(cleaned_name)
-                    
-                    for term in terms:
-                        if self._is_meaningful_term(term):
-                            # Determine category based on patterns
-                            category = self._classify_column_term(term, column, column_patterns)
-                            
-                            suggestion = {
-                                'term': term,
-                                'category': category,
-                                'source_type': 'column',
-                                'source_name': f"{table.name}.{column.name}",
-                                'confidence': self._calculate_term_confidence(term, column),
-                                'auto_definition': self._generate_column_definition(term, column),
-                                'context': {
-                                    'table_name': table.name,
-                                    'column_name': column.name,
-                                    'data_type': column.data_type,
-                                    'business_category': column.business_category,
-                                    'sample_values': column.sample_values[:3] if column.sample_values else []
-                                }
-                            }
-                            suggestions.append(suggestion)
-        
-        return suggestions
-    
-    def _analyze_sample_values(self, project: Project) -> List[Dict[str, Any]]:
-        """Analyze sample values to identify abbreviations and coded values"""
+    def _generate_technical_terms(self, project_data: Dict) -> List[Dict[str, Any]]:
+        """Generate technical term suggestions"""
         suggestions = []
         
-        for source in project.sources:
-            for table in source.tables:
-                for column in table.columns:
-                    if column.sample_values:
-                        # Look for abbreviations
-                        abbrevs = self._extract_abbreviations(column.sample_values)
-                        for abbrev in abbrevs:
-                            suggestion = {
-                                'term': abbrev['code'],
-                                'category': 'abbreviation',
-                                'source_type': 'value',
-                                'source_name': f"{table.name}.{column.name}",
-                                'confidence': abbrev['confidence'],
-                                'auto_definition': f"Abbreviated code: {abbrev['possible_meaning']}",
-                                'context': {
-                                    'table_name': table.name,
-                                    'column_name': column.name,
-                                    'sample_values': column.sample_values[:5],
-                                    'frequency': abbrev['frequency']
-                                }
-                            }
-                            suggestions.append(suggestion)
+        # Data types as technical terms
+        for data_type in project_data.get('data_types', []):
+            if data_type and data_type.upper() not in ['VARCHAR', 'TEXT', 'INTEGER', 'FLOAT']:
+                suggestions.append({
+                    'term': data_type,
+                    'auto_definition': f'Data type used in database schema',
+                    'category': 'technical_term',
+                    'confidence': 0.9,
+                    'context': f'Database data type',
+                    'suggested_domain': 'database',
+                    'suggested_synonyms': []
+                })
         
-        return suggestions
+        # Technical patterns in column names
+        technical_patterns = [
+            r'.*_id$', r'.*_key$', r'.*_ref$', r'.*_code$',
+            r'.*_timestamp$', r'.*_date$', r'.*_flag$'
+        ]
+        
+        for col_name in project_data.get('column_names', []):
+            for pattern in technical_patterns:
+                if re.match(pattern, col_name, re.IGNORECASE):
+                    term_type = pattern.split('_')[-1].replace('$', '')
+                    suggestions.append({
+                        'term': f'{term_type.title()} Field',
+                        'auto_definition': f'Technical field type: {term_type}',
+                        'category': 'technical_term',
+                        'confidence': 0.7,
+                        'context': f'Pattern found in: {col_name}',
+                        'suggested_domain': 'database',
+                        'suggested_synonyms': []
+                    })
+        
+        return self._deduplicate_suggestions(suggestions)
     
-    def _categorize_terms(self, terms: List[Dict[str, Any]]) -> Dict[str, List[Dict]]:
-        """Categorize terms by type and domain"""
-        categorized = {
-            'business_terms': [],
-            'technical_terms': [],
-            'abbreviations': [],
-            'domain_terms': {}
+    def _generate_abbreviations(self, project_data: Dict) -> List[Dict[str, Any]]:
+        """Generate abbreviation suggestions"""
+        suggestions = []
+        
+        # Find potential abbreviations in names
+        all_names = (project_data.get('table_names', []) + 
+                    project_data.get('column_names', []))
+        
+        for name in all_names:
+            abbrevs = self._extract_abbreviations(name)
+            for abbrev in abbrevs:
+                full_form = self._expand_abbreviation(abbrev)
+                if full_form:
+                    suggestions.append({
+                        'term': abbrev.upper(),
+                        'auto_definition': f'Abbreviation for {full_form}',
+                        'category': 'abbreviation',
+                        'confidence': 0.6,
+                        'context': f'Found in: {name}',
+                        'suggested_domain': self._infer_domain(name),
+                        'suggested_synonyms': [full_form]
+                    })
+        
+        # Check against common abbreviations
+        for name in all_names:
+            name_parts = re.split(r'[_\s]+', name.lower())
+            for part in name_parts:
+                if part in self.common_abbreviations:
+                    suggestions.append({
+                        'term': part.upper(),
+                        'auto_definition': f'Common abbreviation for {self.common_abbreviations[part]}',
+                        'category': 'abbreviation',
+                        'confidence': 0.8,
+                        'context': f'Common abbreviation found in: {name}',
+                        'suggested_domain': self._infer_domain(name),
+                        'suggested_synonyms': [self.common_abbreviations[part]]
+                    })
+        
+        return self._deduplicate_suggestions(suggestions)
+    
+    def _generate_domain_terms(self, project_data: Dict) -> Dict[str, List[Dict]]:
+        """Generate domain-specific terms"""
+        domain_suggestions = defaultdict(list)
+        
+        # Infer domains from table and column names
+        all_names = (project_data.get('table_names', []) + 
+                    project_data.get('column_names', []))
+        
+        domain_keywords = {
+            'finance': ['revenue', 'cost', 'profit', 'expense', 'budget', 'price', 'amount', 'payment'],
+            'hr': ['employee', 'salary', 'department', 'manager', 'hire', 'staff'],
+            'sales': ['customer', 'order', 'product', 'quantity', 'discount'],
+            'marketing': ['campaign', 'lead', 'conversion', 'click', 'impression'],
+            'inventory': ['stock', 'warehouse', 'supply', 'vendor'],
+            'operations': ['process', 'workflow', 'task', 'status']
         }
         
-        # Group by category
-        for term in terms:
-            category = term['category']
-            if category in categorized:
-                categorized[category].append(term)
+        for name in all_names:
+            name_lower = name.lower()
+            for domain, keywords in domain_keywords.items():
+                for keyword in keywords:
+                    if keyword in name_lower:
+                        domain_suggestions[domain].append({
+                            'term': name.replace('_', ' ').title(),
+                            'auto_definition': f'{domain.title()} related term',
+                            'category': 'domain_term',
+                            'confidence': 0.7,
+                            'context': f'Domain: {domain}, found in: {name}',
+                            'suggested_domain': domain,
+                            'suggested_synonyms': []
+                        })
         
-        # Group by domain
-        for term in terms:
-            context = term.get('context', {})
-            domain = context.get('business_category')
-            if domain:
-                if domain not in categorized['domain_terms']:
-                    categorized['domain_terms'][domain] = []
-                categorized['domain_terms'][domain].append(term)
+        # Deduplicate within each domain
+        for domain in domain_suggestions:
+            domain_suggestions[domain] = self._deduplicate_suggestions(domain_suggestions[domain])
         
-        # Remove duplicates and sort by confidence
-        for category in categorized:
-            if category != 'domain_terms':
-                categorized[category] = self._deduplicate_terms(categorized[category])
-                categorized[category].sort(key=lambda x: x['confidence'], reverse=True)
-        
-        # Handle domain terms
-        for domain in categorized['domain_terms']:
-            categorized['domain_terms'][domain] = self._deduplicate_terms(
-                categorized['domain_terms'][domain]
-            )
-        
-        return categorized
+        return dict(domain_suggestions)
     
-    def _enhance_with_llm(self, suggestions: Dict[str, Any], project: Project) -> Dict[str, Any]:
-        """Use LLM to enhance term definitions and relationships"""
+    def _enhance_suggestions_with_ai(self, suggestions: Dict, project_data: Dict) -> Dict[str, Any]:
+        """Enhance suggestions using AI"""
+        if not self.client:
+            return suggestions
+        
         try:
-            # Focus on high-confidence business terms
-            high_conf_terms = [
-                term for term in suggestions['business_terms'] 
-                if term['confidence'] > 0.7
-            ][:10]  # Limit to top 10 to avoid long prompts
+            # Prepare context for AI
+            context = {
+                'table_names': project_data.get('table_names', [])[:10],
+                'column_names': project_data.get('column_names', [])[:20],
+                'sample_values': project_data.get('sample_values', [])[:10]
+            }
             
-            if not high_conf_terms:
-                return suggestions
+            # Enhance business terms
+            for suggestion in suggestions.get('business_terms', []):
+                enhanced_def = self._enhance_definition_with_ai(
+                    suggestion['term'], 
+                    suggestion['auto_definition'], 
+                    context
+                )
+                if enhanced_def:
+                    suggestion['enhanced_definition'] = enhanced_def
+                    suggestion['confidence'] = min(1.0, suggestion['confidence'] + 0.1)
             
-            # Build context about the project
-            project_context = self._build_project_context_for_llm(project)
-            
-            # Create prompt for LLM
-            prompt = self._build_enhancement_prompt(high_conf_terms, project_context)
-            
-            # Call LLM
-            response = self._call_llm(prompt)
-            
-            # Parse and apply enhancements
-            enhanced = self._parse_llm_enhancements(response, high_conf_terms)
-            
-            # Update suggestions with enhancements
-            for i, term in enumerate(suggestions['business_terms']):
-                if i < len(enhanced):
-                    term.update(enhanced[i])
+            # Enhance technical terms
+            for suggestion in suggestions.get('technical_terms', []):
+                enhanced_def = self._enhance_definition_with_ai(
+                    suggestion['term'], 
+                    suggestion['auto_definition'], 
+                    context,
+                    is_technical=True
+                )
+                if enhanced_def:
+                    suggestion['enhanced_definition'] = enhanced_def
+                    suggestion['confidence'] = min(1.0, suggestion['confidence'] + 0.1)
             
             return suggestions
             
         except Exception as e:
-            logger.warning(f"LLM enhancement failed: {str(e)}")
+            logger.warning(f"Error enhancing suggestions with AI: {str(e)}")
             return suggestions
     
-    def _clean_identifier(self, name: str) -> str:
-        """Clean table/column identifier"""
-        # Remove common prefixes/suffixes
-        cleaned = re.sub(r'^(tbl_|table_|col_|fld_)', '', name, flags=re.IGNORECASE)
-        cleaned = re.sub(r'(_id|_key|_num|_code)$', '', cleaned, flags=re.IGNORECASE)
-        
-        # Replace underscores and camelCase
-        cleaned = re.sub(r'([a-z])([A-Z])', r'\1_\2', cleaned)
-        cleaned = cleaned.replace('_', ' ')
-        
-        return cleaned.strip()
-    
-    def _extract_terms_from_name(self, name: str) -> List[str]:
-        """Extract meaningful terms from a name"""
-        # Split on common delimiters
-        words = re.split(r'[\s_\-\.]+', name.lower())
-        
-        # Filter meaningful words
-        terms = []
-        for word in words:
-            if len(word) > 2 and word not in self.common_words:
-                terms.append(word.title())
-        
-        return terms
-    
-    def _is_meaningful_term(self, term: str) -> bool:
-        """Check if a term is meaningful for the dictionary"""
-        if len(term) < 3:
-            return False
-        
-        # Skip common words
-        if term.lower() in self.common_words:
-            return False
-        
-        # Skip numeric or mostly numeric terms
-        if re.match(r'^\d+$', term) or len(re.findall(r'\d', term)) / len(term) > 0.5:
-            return False
-        
-        return True
-    
-    def _build_column_patterns(self) -> Dict[str, List[str]]:
-        """Build patterns for classifying column terms"""
-        return {
-            'financial': ['amount', 'price', 'cost', 'revenue', 'profit', 'salary', 'budget'],
-            'temporal': ['date', 'time', 'year', 'month', 'day', 'created', 'updated', 'modified'],
-            'identifier': ['id', 'key', 'code', 'number', 'ref', 'reference'],
-            'descriptive': ['name', 'title', 'description', 'comment', 'note', 'label'],
-            'quantitative': ['count', 'quantity', 'volume', 'weight', 'length', 'size'],
-            'status': ['status', 'state', 'flag', 'active', 'enabled', 'type', 'category']
-        }
-    
-    def _classify_column_term(self, term: str, column: Column, patterns: Dict[str, List[str]]) -> str:
-        """Classify a column term by category"""
-        term_lower = term.lower()
-        
-        # Check against patterns
-        for category, keywords in patterns.items():
-            if any(keyword in term_lower for keyword in keywords):
-                return 'technical_term'
-        
-        # Check data type
-        if column.data_type in ['INTEGER', 'FLOAT', 'DECIMAL']:
-            return 'technical_term'
-        elif column.data_type in ['TIMESTAMP', 'DATE', 'TIME']:
-            return 'technical_term'
-        
-        # Default to business term
-        return 'business_term'
-    
-    def _calculate_term_confidence(self, term: str, column: Column) -> float:
-        """Calculate confidence score for a term"""
-        confidence = 0.5
-        
-        # Boost confidence based on column metadata
-        if column.description:
-            confidence += 0.2
-        
-        if column.business_category:
-            confidence += 0.1
-        
-        # Boost for meaningful names
-        if len(term) > 5:
-            confidence += 0.1
-        
-        # Boost for non-PII data
-        if not column.pii_flag:
-            confidence += 0.1
-        
-        return round(min(confidence, 1.0), 3)
-    
-    def _generate_column_definition(self, term: str, column: Column) -> str:
-        """Generate automatic definition for a column term"""
-        if column.description:
-            return f"Column field: {column.description}"
-        
-        # Generate based on data type and patterns
-        if column.data_type in ['INTEGER', 'FLOAT']:
-            return f"Numeric field representing {term} values"
-        elif column.data_type in ['TIMESTAMP', 'DATE']:
-            return f"Date/time field for {term} information"
-        elif column.pii_flag:
-            return f"Personal information field for {term}"
-        else:
-            return f"Data field containing {term} information"
-    
-    def _extract_abbreviations(self, sample_values: List[str]) -> List[Dict[str, Any]]:
-        """Extract potential abbreviations from sample values"""
-        abbreviations = []
-        
-        # Count value frequencies
-        value_counts = Counter(sample_values)
-        
-        for value, count in value_counts.items():
-            value_str = str(value).strip().upper()
-            
-            # Look for abbreviation patterns
-            if self._looks_like_abbreviation(value_str):
-                abbrev = {
-                    'code': value_str,
-                    'frequency': count,
-                    'confidence': self._calculate_abbrev_confidence(value_str, count, len(sample_values)),
-                    'possible_meaning': self._guess_abbreviation_meaning(value_str)
-                }
-                abbreviations.append(abbrev)
-        
-        return abbreviations
-    
-    def _looks_like_abbreviation(self, value: str) -> bool:
-        """Check if a value looks like an abbreviation"""
-        if not value or len(value) > 10:
-            return False
-        
-        # Patterns for abbreviations
-        patterns = [
-            r'^[A-Z]{2,5}$',  # All caps, 2-5 letters
-            r'^[A-Z]\d{1,3}$',  # Letter followed by digits
-            r'^[A-Z]{1,3}_[A-Z]{1,3}$',  # Underscore separated
-            r'^[A-Z]{2,3}\-[A-Z]{2,3}$'  # Hyphen separated
-        ]
-        
-        return any(re.match(pattern, value) for pattern in patterns)
-    
-    def _calculate_abbrev_confidence(self, value: str, frequency: int, total_samples: int) -> float:
-        """Calculate confidence for abbreviation"""
-        # Base confidence
-        confidence = 0.6
-        
-        # Boost for common patterns
-        if re.match(r'^[A-Z]{2,3}$', value):
-            confidence += 0.2
-        
-        # Boost for frequency
-        if frequency / total_samples > 0.1:
-            confidence += 0.1
-        
-        return round(min(confidence, 1.0), 3)
-    
-    def _guess_abbreviation_meaning(self, abbrev: str) -> str:
-        """Guess the meaning of an abbreviation"""
-        # Common abbreviation mappings
-        common_abbrevs = {
-            'USA': 'United States of America',
-            'UK': 'United Kingdom',
-            'NYC': 'New York City',
-            'LA': 'Los Angeles',
-            'CA': 'California',
-            'NY': 'New York',
-            'FL': 'Florida',
-            'TX': 'Texas',
-            'USD': 'US Dollar',
-            'EUR': 'Euro',
-            'GBP': 'British Pound',
-            'CEO': 'Chief Executive Officer',
-            'CTO': 'Chief Technology Officer',
-            'HR': 'Human Resources',
-            'IT': 'Information Technology',
-            'QA': 'Quality Assurance'
-        }
-        
-        if abbrev in common_abbrevs:
-            return common_abbrevs[abbrev]
-        
-        # Generate generic meaning
-        if len(abbrev) == 2:
-            return f"Two-letter code for {abbrev}"
-        elif len(abbrev) == 3:
-            return f"Three-letter code for {abbrev}"
-        else:
-            return f"Coded value: {abbrev}"
-    
-    def _deduplicate_terms(self, terms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove duplicate terms, keeping highest confidence"""
-        seen_terms = {}
-        
-        for term in terms:
-            term_key = term['term'].lower()
-            if term_key not in seen_terms or term['confidence'] > seen_terms[term_key]['confidence']:
-                seen_terms[term_key] = term
-        
-        return list(seen_terms.values())
-    
-    def _load_common_words(self) -> Set[str]:
-        """Load common English words to filter out"""
-        common_words = {
-            'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
-            'from', 'as', 'is', 'was', 'are', 'were', 'be', 'been', 'have', 'has', 'had',
-            'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
-            'can', 'must', 'shall', 'this', 'that', 'these', 'those', 'a', 'an',
-            'all', 'any', 'some', 'no', 'not', 'only', 'own', 'same', 'so', 'than',
-            'too', 'very', 'just', 'now', 'how', 'where', 'why', 'when', 'what',
-            'who', 'which', 'if', 'then', 'else', 'each', 'every', 'both', 'either',
-            'neither', 'more', 'most', 'other', 'such', 'few', 'many', 'much',
-            'data', 'info', 'information', 'record', 'field', 'value', 'item'
-        }
-        return common_words
-    
-    def _build_project_context_for_llm(self, project: Project) -> str:
-        """Build context about project for LLM enhancement"""
-        context_parts = [
-            f"Project: {project.name}",
-            f"Description: {project.description or 'No description'}"
-        ]
-        
-        # Add table overview
-        table_names = []
-        for source in project.sources:
-            for table in source.tables:
-                table_names.append(table.name)
-        
-        if table_names:
-            context_parts.append(f"Tables: {', '.join(table_names[:10])}")
-        
-        return "\n".join(context_parts)
-    
-    def _build_enhancement_prompt(self, terms: List[Dict], context: str) -> str:
-        """Build prompt for LLM to enhance term definitions"""
-        terms_text = "\n".join([
-            f"- {term['term']}: {term['auto_definition']}"
-            for term in terms
-        ])
-        
-        prompt = f"""
-You are a data analyst creating a business glossary. Given the following context and automatically generated terms, 
-provide enhanced definitions that are clear, business-focused, and accurate.
-
-Context:
-{context}
-
-Terms to enhance:
-{terms_text}
-
-For each term, provide:
-1. An improved definition (1-2 sentences)
-2. Any relevant synonyms
-3. The business domain it belongs to
-
-Respond in JSON format:
-[
-  {{
-    "term": "term_name",
-    "enhanced_definition": "improved definition",
-    "synonyms": ["synonym1", "synonym2"],
-    "domain": "business_domain"
-  }}
-]
-"""
-        return prompt
-    
-    def _call_llm(self, prompt: str) -> str:
-        """Call Azure OpenAI for enhancement"""
+    def _enhance_definition_with_ai(self, term: str, basic_definition: str, 
+                                  context: Dict, is_technical: bool = False) -> Optional[str]:
+        """Enhance a definition using AI"""
         try:
+            context_type = "technical database" if is_technical else "business"
+            
+            prompt = f"""
+            Improve this {context_type} definition for the term "{term}":
+            
+            Current definition: {basic_definition}
+            
+            Context from data schema:
+            Tables: {', '.join(context.get('table_names', []))}
+            Columns: {', '.join(context.get('column_names', []))}
+            
+            Provide a clear, concise definition (max 100 words) that would be useful in a data dictionary.
+            """
+            
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert business analyst and data dictionary curator."},
+                    {"role": "system", "content": "You are a data analyst helping create clear definitions for a data dictionary."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=1500,
+                max_tokens=150,
                 temperature=0.3
             )
             
-            return response.choices[0].message.content.strip()
+            enhanced_def = response.choices[0].message.content.strip()
+            
+            # Basic validation
+            if len(enhanced_def) > 20 and enhanced_def != basic_definition:
+                return enhanced_def
+            
+            return None
             
         except Exception as e:
-            logger.error(f"Error calling LLM for enhancement: {str(e)}")
-            raise
+            logger.warning(f"Error enhancing definition for {term}: {str(e)}")
+            return None
     
-    def _parse_llm_enhancements(self, response: str, original_terms: List[Dict]) -> List[Dict]:
-        """Parse LLM response and apply enhancements"""
-        try:
-            enhancements = json.loads(response)
-            enhanced_terms = []
-            
-            for i, enhancement in enumerate(enhancements):
-                if i < len(original_terms):
-                    enhanced = original_terms[i].copy()
-                    enhanced.update({
-                        'enhanced_definition': enhancement.get('enhanced_definition'),
-                        'suggested_synonyms': enhancement.get('synonyms', []),
-                        'suggested_domain': enhancement.get('domain'),
-                        'llm_enhanced': True
-                    })
-                    enhanced_terms.append(enhanced)
-            
-            return enhanced_terms
-            
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM enhancement response")
-            return original_terms
+    def _extract_business_terms_from_text(self, text: str) -> List[str]:
+        """Extract potential business terms from text"""
+        terms = []
+        
+        # Split camelCase and snake_case
+        words = re.findall(r'[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', text)
+        words.extend(text.split('_'))
+        
+        # Clean and filter words
+        for word in words:
+            word = word.strip().lower()
+            if (len(word) > 2 and 
+                word not in ['the', 'and', 'or', 'of', 'in', 'to', 'for', 'with'] and
+                word in self.business_keywords):
+                terms.append(word.title())
+        
+        return list(set(terms))
     
-    def create_bulk_entries(self, project_id: int, suggestions: List[Dict[str, Any]], 
-                           created_by: str = 'system') -> List[int]:
-        """Create multiple dictionary entries from suggestions"""
-        try:
-            created_ids = []
-            
-            for suggestion in suggestions:
-                # Check if term already exists
-                existing = DictionaryEntry.query.filter_by(
-                    project_id=project_id,
-                    term=suggestion['term']
-                ).first()
-                
-                if existing:
-                    continue
-                
-                # Create new entry
-                entry = DictionaryEntry(
-                    project_id=project_id,
-                    term=suggestion['term'],
-                    definition=suggestion.get('enhanced_definition') or suggestion.get('auto_definition'),
-                    category=suggestion.get('category', 'business_term'),
-                    synonyms=suggestion.get('suggested_synonyms', []),
-                    domain=suggestion.get('suggested_domain'),
-                    is_auto_generated=True,
-                    confidence_score=suggestion.get('confidence', 0.5),
-                    source_tables=suggestion.get('context', {}).get('table_name'),
-                    created_by=created_by,
-                    status='draft'
-                )
-                
-                db.session.add(entry)
-                db.session.flush()
-                created_ids.append(entry.id)
-            
-            db.session.commit()
-            return created_ids
-            
-        except Exception as e:
-            db.session.rollback()
-            logger.error(f"Error creating bulk dictionary entries: {str(e)}")
-            raise
+    def _extract_abbreviations(self, text: str) -> List[str]:
+        """Extract potential abbreviations from text"""
+        abbreviations = []
+        
+        # Look for uppercase letter sequences
+        matches = re.findall(r'[A-Z]{2,}', text)
+        abbreviations.extend(matches)
+        
+        # Look for patterns like 'id', 'cd', 'no'
+        short_patterns = re.findall(r'\b[a-z]{2,3}\b', text.lower())
+        for pattern in short_patterns:
+            if pattern in self.common_abbreviations:
+                abbreviations.append(pattern)
+        
+        return list(set(abbreviations))
     
-    def export_dictionary(self, project_id: int) -> Dict[str, Any]:
-        """Export dictionary to JSON format"""
-        try:
-            project = Project.query.get(project_id)
-            if not project:
-                raise ValueError(f"Project {project_id} not found")
+    def _expand_abbreviation(self, abbrev: str) -> Optional[str]:
+        """Expand abbreviation to full form"""
+        abbrev_lower = abbrev.lower()
+        
+        if abbrev_lower in self.common_abbreviations:
+            return self.common_abbreviations[abbrev_lower]
+        
+        # Try to guess based on context
+        expansion_patterns = {
+            'id': 'Identifier',
+            'cd': 'Code',
+            'no': 'Number',
+            'qty': 'Quantity',
+            'amt': 'Amount',
+            'desc': 'Description',
+            'addr': 'Address',
+            'ref': 'Reference'
+        }
+        
+        return expansion_patterns.get(abbrev_lower)
+    
+    def _infer_domain(self, text: str) -> Optional[str]:
+        """Infer business domain from text"""
+        text_lower = text.lower()
+        
+        domain_indicators = {
+            'finance': ['revenue', 'cost', 'profit', 'expense', 'budget', 'price', 'amount', 'payment', 'invoice'],
+            'hr': ['employee', 'staff', 'salary', 'department', 'manager', 'hire'],
+            'sales': ['customer', 'order', 'product', 'quantity', 'discount', 'sale'],
+            'marketing': ['campaign', 'lead', 'conversion', 'click', 'impression', 'ad'],
+            'inventory': ['stock', 'warehouse', 'supply', 'vendor', 'item'],
+            'operations': ['process', 'workflow', 'task', 'status', 'operation']
+        }
+        
+        for domain, indicators in domain_indicators.items():
+            if any(indicator in text_lower for indicator in indicators):
+                return domain
+        
+        return None
+    
+    def _find_synonyms(self, term: str) -> List[str]:
+        """Find potential synonyms for a term"""
+        synonym_map = {
+            'customer': ['client', 'buyer'],
+            'product': ['item', 'good'],
+            'order': ['purchase', 'transaction'],
+            'employee': ['staff', 'worker'],
+            'revenue': ['income', 'sales'],
+            'cost': ['expense', 'expenditure']
+        }
+        
+        return synonym_map.get(term.lower(), [])
+    
+    def _deduplicate_suggestions(self, suggestions: List[Dict]) -> List[Dict]:
+        """Remove duplicate suggestions"""
+        seen = set()
+        unique_suggestions = []
+        
+        for suggestion in suggestions:
+            term_key = suggestion['term'].lower()
+            if term_key not in seen:
+                seen.add(term_key)
+                unique_suggestions.append(suggestion)
+        
+        return unique_suggestions
+    
+    def _filter_and_rank_suggestions(self, suggestions: Dict, project_id: int) -> Dict[str, Any]:
+        """Filter and rank suggestions"""
+        # Get existing terms to avoid duplicates
+        existing_terms = set(
+            term.term.lower() for term in 
+            DictionaryEntry.query.filter_by(project_id=project_id).all()
+        )
+        
+        # Filter and rank each category
+        for category in suggestions:
+            if isinstance(suggestions[category], list):
+                # Filter out existing terms
+                filtered = [
+                    s for s in suggestions[category] 
+                    if s['term'].lower() not in existing_terms
+                ]
+                
+                # Sort by confidence
+                filtered.sort(key=lambda x: x['confidence'], reverse=True)
+                
+                # Limit results
+                suggestions[category] = filtered[:20]
             
-            entries = DictionaryEntry.query.filter_by(
-                project_id=project_id
-            ).filter(
-                DictionaryEntry.status != 'archived'
-            ).all()
-            
-            export_data = {
-                'project': {
-                    'id': project.id,
-                    'name': project.name,
-                    'description': project.description
-                },
-                'exported_at': datetime.utcnow().isoformat(),
-                'entries': [entry.to_dict() for entry in entries],
-                'total_entries': len(entries)
-            }
-            
-            return export_data
-            
-        except Exception as e:
-            logger.error(f"Error exporting dictionary: {str(e)}")
-            raise
+            elif isinstance(suggestions[category], dict):
+                # Handle domain terms
+                for domain in suggestions[category]:
+                    filtered = [
+                        s for s in suggestions[category][domain]
+                        if s['term'].lower() not in existing_terms
+                    ]
+                    filtered.sort(key=lambda x: x['confidence'], reverse=True)
+                    suggestions[category][domain] = filtered[:10]
+        
+        return suggestions
+    
+    def _count_suggestions(self, suggestions: Dict) -> int:
+        """Count total suggestions"""
+        count = 0
+        for category, items in suggestions.items():
+            if isinstance(items, list):
+                count += len(items)
+            elif isinstance(items, dict):
+                for domain_items in items.values():
+                    count += len(domain_items)
+        return count
+    
+    def _load_common_abbreviations(self) -> Dict[str, str]:
+        """Load common abbreviations mapping"""
+        return {
+            'id': 'Identifier',
+            'cd': 'Code',
+            'no': 'Number',
+            'qty': 'Quantity',
+            'amt': 'Amount',
+            'desc': 'Description',
+            'addr': 'Address',
+            'ref': 'Reference',
+            'dept': 'Department',
+            'mgr': 'Manager',
+            'emp': 'Employee',
+            'cust': 'Customer',
+            'prod': 'Product',
+            'ord': 'Order',
+            'inv': 'Invoice',
+            'acct': 'Account',
+            'bal': 'Balance',
+            'calc': 'Calculated',
+            'ctrl': 'Control',
+            'stat': 'Status',
+            'sys': 'System',
+            'tmp': 'Temporary',
+            'usr': 'User',
+            'grp': 'Group',
+            'org': 'Organization',
+            'loc': 'Location',
+            'cat': 'Category',
+            'type': 'Type',
+            'src': 'Source',
+            'tgt': 'Target',
+            'min': 'Minimum',
+            'max': 'Maximum',
+            'avg': 'Average',
+            'cnt': 'Count',
+            'sum': 'Sum',
+            'pct': 'Percent'
+        }
+    
+    def _load_business_keywords(self) -> Set[str]:
+        """Load business keywords for term extraction"""
+        return {
+            'customer', 'client', 'buyer', 'user', 'account', 'contact',
+            'product', 'service', 'item', 'good', 'offering',
+            'order', 'purchase', 'transaction', 'sale', 'deal',
+            'revenue', 'income', 'profit', 'cost', 'expense', 'budget',
+            'price', 'amount', 'value', 'total', 'sum',
+            'employee', 'staff', 'worker', 'manager', 'team',
+            'department', 'division', 'unit', 'group', 'organization',
+            'campaign', 'marketing', 'promotion', 'advertisement',
+            'lead', 'prospect', 'opportunity', 'conversion',
+            'inventory', 'stock', 'warehouse', 'supply', 'vendor',
+            'process', 'workflow', 'task', 'project', 'activity',
+            'report', 'dashboard', 'analytics', 'metric', 'kpi',
+            'date', 'time', 'period', 'quarter', 'year',
+            'status', 'state', 'condition', 'flag', 'indicator',
+            'category', 'type', 'class', 'segment', 'group',
+            'location', 'region', 'country', 'city', 'address',
+            'contract', 'agreement', 'policy', 'terms',
+            'payment', 'invoice', 'billing', 'charge', 'fee'
+        }

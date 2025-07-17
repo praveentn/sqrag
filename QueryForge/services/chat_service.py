@@ -42,7 +42,7 @@ class ChatService:
             logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}")
             raise
     
-    def extract_entities(self, query: str, project_id: int) -> Dict[str, Any]:
+    def extract_entities(self, query: str, project_id: int) -> List[Dict[str, Any]]:
         """Extract entities from natural language query using LLM"""
         start_time = time.time()
         
@@ -63,439 +63,290 @@ class ChatService:
             
             # Parse response
             try:
-                entities_raw = json.loads(response)
-                entities = self._validate_and_enhance_entities(entities_raw, project_id)
+                entities = json.loads(response)
+                if isinstance(entities, dict) and 'entities' in entities:
+                    entities = entities['entities']
             except json.JSONDecodeError:
-                # Fallback: extract entities using regex if JSON parsing fails
-                logger.warning("LLM response not valid JSON, using fallback extraction")
-                entities = self._fallback_entity_extraction(query, project_id)
+                # Fallback: extract entities using pattern matching
+                entities = self._extract_entities_fallback(query, context)
             
-            extraction_time = round((time.time() - start_time) * 1000, 2)
+            # Validate and enhance entities
+            validated_entities = self._validate_entities(entities, context)
             
-            return {
-                'entities': entities,
-                'extraction_time_ms': extraction_time,
-                'query': query,
-                'context_used': {
-                    'tables_count': len(context['tables']),
-                    'columns_count': len(context['columns']),
-                    'dictionary_terms_count': len(context['dictionary_terms'])
-                }
-            }
+            logger.info(f"Extracted {len(validated_entities)} entities in {time.time() - start_time:.2f}s")
+            return validated_entities
             
         except Exception as e:
             logger.error(f"Error extracting entities: {str(e)}")
-            raise Exception(f"Entity extraction failed: {str(e)}")
+            # Fallback to rule-based extraction
+            context = self._build_project_context(project_id)
+            return self._extract_entities_fallback(query, context)
     
-    def map_entities_to_schema(self, entities: List[Dict], project_id: int) -> Dict[str, Any]:
-        """Map extracted entities to actual table/column schema"""
-        start_time = time.time()
-        
+    def map_entities_to_schema(self, entities: List[Dict], project_id: int) -> List[Dict[str, Any]]:
+        """Map extracted entities to database schema elements"""
         try:
             mappings = []
             
+            # Get schema information
+            tables = Table.query.join(DataSource).filter(
+                DataSource.project_id == project_id
+            ).all()
+            
+            columns = Column.query.join(Table).join(DataSource).filter(
+                DataSource.project_id == project_id
+            ).all()
+            
             for entity in entities:
-                entity_text = entity['entity']
+                entity_text = entity.get('text', '').lower()
                 entity_type = entity.get('type', 'unknown')
-                confidence = entity.get('confidence', 0.5)
                 
-                # Find best matches for this entity
-                matches = self._find_entity_matches(entity_text, entity_type, project_id)
+                best_mappings = []
                 
-                if matches:
-                    mapping = {
-                        'entity': entity_text,
-                        'entity_type': entity_type,
-                        'entity_confidence': confidence,
-                        'matches': matches,
-                        'best_match': matches[0] if matches else None
-                    }
-                    mappings.append(mapping)
+                # Map to tables
+                for table in tables:
+                    similarity = self._calculate_similarity(entity_text, table.name.lower())
+                    if similarity > 0.6:  # Threshold for table matching
+                        best_mappings.append({
+                            'entity': entity_text,
+                            'type': 'table',
+                            'table': table.name,
+                            'column': None,
+                            'confidence': round(similarity, 3),
+                            'object_id': table.id
+                        })
+                
+                # Map to columns
+                for column in columns:
+                    # Check column name similarity
+                    col_similarity = self._calculate_similarity(entity_text, column.name.lower())
+                    
+                    # Check display name similarity
+                    if column.display_name:
+                        display_similarity = self._calculate_similarity(
+                            entity_text, column.display_name.lower()
+                        )
+                        col_similarity = max(col_similarity, display_similarity)
+                    
+                    # Check business category
+                    if column.business_category:
+                        cat_similarity = self._calculate_similarity(
+                            entity_text, column.business_category.lower()
+                        )
+                        col_similarity = max(col_similarity, cat_similarity)
+                    
+                    # Check sample values
+                    if column.sample_values:
+                        for sample in column.sample_values[:5]:  # Check first 5 samples
+                            sample_similarity = self._calculate_similarity(
+                                entity_text, str(sample).lower()
+                            )
+                            col_similarity = max(col_similarity, sample_similarity)
+                    
+                    if col_similarity > 0.5:  # Threshold for column matching
+                        best_mappings.append({
+                            'entity': entity_text,
+                            'type': 'column',
+                            'table': column.table.name,
+                            'column': column.name,
+                            'confidence': round(col_similarity, 3),
+                            'object_id': column.id,
+                            'data_type': column.data_type
+                        })
+                
+                # Sort by confidence and take top mappings
+                best_mappings.sort(key=lambda x: x['confidence'], reverse=True)
+                mappings.extend(best_mappings[:3])  # Top 3 mappings per entity
             
-            # Rank and filter mappings
-            ranked_mappings = self._rank_mappings(mappings, project_id)
+            # Remove duplicates and sort by confidence
+            unique_mappings = []
+            seen = set()
             
-            mapping_time = round((time.time() - start_time) * 1000, 2)
+            for mapping in sorted(mappings, key=lambda x: x['confidence'], reverse=True):
+                key = f"{mapping['table']}.{mapping['column']}"
+                if key not in seen:
+                    unique_mappings.append(mapping)
+                    seen.add(key)
             
-            return {
-                'mappings': ranked_mappings,
-                'mapping_time_ms': mapping_time,
-                'total_entities': len(entities),
-                'mapped_entities': len(ranked_mappings)
-            }
+            return unique_mappings[:10]  # Return top 10 mappings
             
         except Exception as e:
-            logger.error(f"Error mapping entities: {str(e)}")
-            raise Exception(f"Entity mapping failed: {str(e)}")
+            logger.error(f"Error mapping entities to schema: {str(e)}")
+            return []
     
-    def generate_sql(self, query: str, entities: List[Dict], mappings: List[Dict], project_id: int) -> Dict[str, Any]:
-        """Generate SQL query from natural language and mapped entities"""
-        start_time = time.time()
-        
+    def generate_sql(self, query: str, entities: List[Dict], 
+                    mappings: List[Dict], project_id: int) -> Dict[str, Any]:
+        """Generate SQL query from natural language and mappings"""
         try:
-            # Build enhanced context with mappings
-            context = self._build_sql_generation_context(mappings, project_id)
+            # Build schema context
+            schema_context = self._build_schema_context(mappings, project_id)
             
-            # Build prompt for SQL generation
+            # Build SQL generation prompt
             prompt = Config.PROMPTS['sql_generation'].format(
                 query=query,
-                schemas=context['schemas'],
-                entities=json.dumps(entities, indent=2)
+                entities=json.dumps(entities, indent=2),
+                mappings=json.dumps(mappings, indent=2),
+                schema=schema_context['schema'],
+                relationships=schema_context['relationships']
             )
             
-            # Call Azure OpenAI for SQL generation
+            # Call LLM
             response = self._call_llm(prompt, max_tokens=1500)
             
             # Parse response
             try:
                 sql_result = json.loads(response)
             except json.JSONDecodeError:
-                # Fallback: extract SQL from text response
-                sql_result = self._fallback_sql_extraction(response)
+                # Extract SQL from response if JSON parsing fails
+                sql_match = re.search(r'```sql\n(.*?)\n```', response, re.DOTALL)
+                if sql_match:
+                    sql_query = sql_match.group(1).strip()
+                else:
+                    # Try to find SQL without markdown
+                    sql_query = self._extract_sql_from_text(response)
+                
+                sql_result = {
+                    'sql': sql_query,
+                    'explanation': 'Generated SQL query from natural language',
+                    'confidence': 0.7
+                }
             
-            # Validate and clean SQL
-            sql_query = sql_result.get('sql', '')
-            validated_sql = self._validate_and_clean_sql(sql_query)
+            # Validate SQL
+            sql_result = self._validate_and_enhance_sql(sql_result, mappings)
             
-            generation_time = round((time.time() - start_time) * 1000, 2)
-            
-            return {
-                'sql': validated_sql,
-                'rationale': sql_result.get('rationale', ''),
-                'confidence': sql_result.get('confidence', 0.7),
-                'tables_used': sql_result.get('tables_used', []),
-                'assumptions': sql_result.get('assumptions', []),
-                'generation_time_ms': generation_time,
-                'context_tables': len(context['schemas'])
-            }
+            return sql_result
             
         except Exception as e:
             logger.error(f"Error generating SQL: {str(e)}")
-            raise Exception(f"SQL generation failed: {str(e)}")
+            return {
+                'sql': '',
+                'explanation': f'Error generating SQL: {str(e)}',
+                'confidence': 0.0,
+                'error': str(e)
+            }
     
-    def execute_sql_safely(self, sql_query: str, project_id: int) -> Dict[str, Any]:
+    def execute_sql_safely(self, sql: str, project_id: int) -> Dict[str, Any]:
         """Execute SQL query with safety checks"""
-        start_time = time.time()
-        
         try:
-            # Validate SQL safety
-            if not self._is_sql_safe(sql_query):
-                raise Exception("SQL query failed safety validation")
+            # Security checks
+            if not self._is_sql_safe(sql):
+                raise ValueError("SQL query contains potentially dangerous operations")
             
-            # Get project's data sources
-            project = Project.query.get(project_id)
-            if not project:
-                raise Exception(f"Project {project_id} not found")
+            # Get first data source for the project (assuming single DB per project for now)
+            data_source = DataSource.query.filter_by(
+                project_id=project_id,
+                type='database'
+            ).first()
             
-            # For now, we'll execute against the first database source
-            # In production, you might want to let users choose or have a default
-            db_source = None
-            for source in project.sources:
-                if source.type == 'database':
-                    db_source = source
-                    break
+            if not data_source:
+                # For file-based sources, we need to create a temporary database
+                return self._execute_on_file_sources(sql, project_id)
             
-            if not db_source:
-                # If no database source, we might need to create a temporary database
-                # with file data or use SQLite in-memory database
-                return self._execute_on_file_data(sql_query, project_id)
-            
-            # Execute on database
-            connection_string = self._build_connection_string(db_source.connection_config)
+            # Execute on database source
+            connection_string = self._build_connection_string(data_source.connection_config)
             engine = create_engine(connection_string)
             
-            with engine.connect() as conn:
-                # Set query timeout
-                conn = conn.execution_options(
-                    autocommit=True,
-                    isolation_level="AUTOCOMMIT"
-                )
-                
-                result = conn.execute(text(sql_query))
-                
-                # Fetch results
-                if result.returns_rows:
-                    columns = list(result.keys())
-                    rows = result.fetchall()
-                    data = [dict(zip(columns, row)) for row in rows]
-                    
-                    # Limit rows returned
-                    max_rows = Config.SQL_CONFIG['max_rows']
-                    if len(data) > max_rows:
-                        data = data[:max_rows]
-                        truncated = True
-                    else:
-                        truncated = False
-                else:
-                    columns = []
-                    data = []
-                    truncated = False
+            start_time = time.time()
             
-            execution_time = round((time.time() - start_time) * 1000, 2)
+            with engine.connect() as conn:
+                result = conn.execute(text(sql))
+                columns = list(result.keys())
+                data = [dict(row) for row in result.fetchall()]
+            
+            execution_time = time.time() - start_time
             
             return {
                 'success': True,
-                'columns': columns,
                 'data': data,
+                'columns': columns,
                 'row_count': len(data),
-                'truncated': truncated,
-                'execution_time_ms': execution_time,
-                'sql_query': sql_query
+                'execution_time_seconds': round(execution_time, 3),
+                'sql': sql
             }
             
         except Exception as e:
-            execution_time = round((time.time() - start_time) * 1000, 2)
             logger.error(f"Error executing SQL: {str(e)}")
             return {
                 'success': False,
                 'error': str(e),
-                'execution_time_ms': execution_time,
-                'sql_query': sql_query
+                'sql': sql
             }
     
-    def refine_sql_with_feedback(self, original_query: str, generated_sql: str, 
-                                result: Dict, feedback: str, project_id: int) -> Dict[str, Any]:
-        """Refine SQL based on user feedback"""
+    def generate_natural_language_answer(self, query: str, sql: str, 
+                                       results: Dict, project_id: int) -> str:
+        """Generate natural language answer from SQL results"""
         try:
-            # Build context for refinement
-            context = self._build_project_context(project_id)
-            
-            prompt = Config.PROMPTS['sql_refinement'].format(
-                original_query=original_query,
-                generated_sql=generated_sql,
-                result=json.dumps(result, indent=2),
-                feedback=feedback,
-                schemas=context['schemas']
+            # Build prompt for answer generation
+            prompt = Config.PROMPTS['answer_generation'].format(
+                original_query=query,
+                sql_query=sql,
+                results=json.dumps(results['data'][:10], indent=2),  # First 10 rows
+                row_count=results['row_count']
             )
             
-            response = self._call_llm(prompt, max_tokens=1500)
+            # Call LLM
+            answer = self._call_llm(prompt, max_tokens=500)
             
-            try:
-                refined_result = json.loads(response)
-            except json.JSONDecodeError:
-                refined_result = self._fallback_sql_extraction(response)
+            # Clean up answer
+            answer = answer.strip()
+            if answer.startswith('"') and answer.endswith('"'):
+                answer = answer[1:-1]
             
-            return refined_result
+            return answer
             
         except Exception as e:
-            logger.error(f"Error refining SQL: {str(e)}")
-            raise Exception(f"SQL refinement failed: {str(e)}")
+            logger.error(f"Error generating natural language answer: {str(e)}")
+            return f"I found {results.get('row_count', 0)} results for your query, but I couldn't generate a natural language explanation."
     
     def _build_project_context(self, project_id: int) -> Dict[str, Any]:
-        """Build context about project's tables, columns, and dictionary"""
+        """Build context information for the project"""
         try:
-            project = Project.query.get(project_id)
-            if not project:
-                raise Exception(f"Project {project_id} not found")
+            # Get tables
+            tables = Table.query.join(DataSource).filter(
+                DataSource.project_id == project_id
+            ).all()
             
-            # Get tables and columns
-            tables_info = []
-            columns_info = []
-            
-            for source in project.sources:
-                for table in source.tables:
-                    table_info = {
-                        'name': table.name,
-                        'display_name': table.display_name,
-                        'description': table.description,
-                        'row_count': table.row_count
-                    }
-                    tables_info.append(table_info)
-                    
-                    for column in table.columns:
-                        column_info = {
-                            'table': table.name,
-                            'name': column.name,
-                            'display_name': column.display_name,
-                            'description': column.description,
-                            'type': column.data_type,
-                            'business_category': column.business_category
-                        }
-                        columns_info.append(column_info)
+            # Get columns  
+            columns = Column.query.join(Table).join(DataSource).filter(
+                DataSource.project_id == project_id
+            ).all()
             
             # Get dictionary terms
-            dictionary_terms = []
-            for entry in project.dictionary_entries:
-                if entry.status != 'archived':
-                    term_info = {
-                        'term': entry.term,
-                        'definition': entry.definition,
-                        'synonyms': entry.synonyms or [],
-                        'category': entry.category,
-                        'domain': entry.domain
-                    }
-                    dictionary_terms.append(term_info)
+            dictionary_terms = DictionaryEntry.query.filter_by(
+                project_id=project_id,
+                status='approved'
+            ).all()
             
-            return {
-                'tables': tables_info,
-                'columns': columns_info,
-                'dictionary_terms': dictionary_terms,
-                'schemas': self._build_schema_context(project_id)
+            context = {
+                'tables': [
+                    {
+                        'name': table.name,
+                        'display_name': table.display_name,
+                        'description': table.description
+                    } for table in tables
+                ],
+                'columns': [
+                    {
+                        'name': column.name,
+                        'table': column.table.name,
+                        'data_type': column.data_type,
+                        'business_category': column.business_category,
+                        'display_name': column.display_name
+                    } for column in columns
+                ],
+                'dictionary_terms': [
+                    {
+                        'term': term.term,
+                        'definition': term.definition,
+                        'synonyms': term.synonyms
+                    } for term in dictionary_terms
+                ]
             }
+            
+            return context
             
         except Exception as e:
             logger.error(f"Error building project context: {str(e)}")
-            raise
-    
-    def _build_schema_context(self, project_id: int) -> str:
-        """Build detailed schema context for SQL generation"""
-        try:
-            project = Project.query.get(project_id)
-            schema_lines = []
-            
-            for source in project.sources:
-                for table in source.tables:
-                    schema_lines.append(f"\nTable: {table.name}")
-                    if table.description:
-                        schema_lines.append(f"Description: {table.description}")
-                    
-                    schema_lines.append("Columns:")
-                    for column in table.columns:
-                        col_line = f"  - {column.name} ({column.data_type})"
-                        if column.description:
-                            col_line += f" - {column.description}"
-                        if column.is_primary_key:
-                            col_line += " [PRIMARY KEY]"
-                        if column.is_foreign_key:
-                            col_line += " [FOREIGN KEY]"
-                        schema_lines.append(col_line)
-                    
-                    schema_lines.append(f"Row count: {table.row_count}")
-            
-            return "\n".join(schema_lines)
-            
-        except Exception as e:
-            logger.error(f"Error building schema context: {str(e)}")
-            return ""
-    
-    def _find_entity_matches(self, entity_text: str, entity_type: str, project_id: int) -> List[Dict]:
-        """Find matching tables/columns for an entity"""
-        matches = []
-        
-        # Get all tables and columns for the project
-        project = Project.query.get(project_id)
-        if not project:
-            return matches
-        
-        # Search in tables
-        for source in project.sources:
-            for table in source.tables:
-                # Exact match
-                if entity_text.lower() == table.name.lower():
-                    matches.append({
-                        'type': 'table',
-                        'name': table.name,
-                        'display_name': table.display_name,
-                        'description': table.description,
-                        'match_type': 'exact',
-                        'confidence': 1.0,
-                        'table_id': table.id
-                    })
-                # Fuzzy match
-                elif fuzz.ratio(entity_text.lower(), table.name.lower()) > 80:
-                    confidence = round(fuzz.ratio(entity_text.lower(), table.name.lower()) / 100, 3)
-                    matches.append({
-                        'type': 'table',
-                        'name': table.name,
-                        'display_name': table.display_name,
-                        'description': table.description,
-                        'match_type': 'fuzzy',
-                        'confidence': confidence,
-                        'table_id': table.id
-                    })
-                
-                # Search in columns
-                for column in table.columns:
-                    # Exact match
-                    if entity_text.lower() == column.name.lower():
-                        matches.append({
-                            'type': 'column',
-                            'name': column.name,
-                            'table': table.name,
-                            'display_name': column.display_name,
-                            'description': column.description,
-                            'data_type': column.data_type,
-                            'match_type': 'exact',
-                            'confidence': 1.0,
-                            'column_id': column.id,
-                            'table_id': table.id
-                        })
-                    # Fuzzy match
-                    elif fuzz.ratio(entity_text.lower(), column.name.lower()) > 70:
-                        confidence = round(fuzz.ratio(entity_text.lower(), column.name.lower()) / 100, 3)
-                        matches.append({
-                            'type': 'column',
-                            'name': column.name,
-                            'table': table.name,
-                            'display_name': column.display_name,
-                            'description': column.description,
-                            'data_type': column.data_type,
-                            'match_type': 'fuzzy',
-                            'confidence': confidence,
-                            'column_id': column.id,
-                            'table_id': table.id
-                        })
-        
-        # Search in dictionary
-        for entry in project.dictionary_entries:
-            if entry.status != 'archived':
-                # Exact match
-                if entity_text.lower() == entry.term.lower():
-                    matches.append({
-                        'type': 'dictionary_term',
-                        'name': entry.term,
-                        'definition': entry.definition,
-                        'synonyms': entry.synonyms,
-                        'match_type': 'exact',
-                        'confidence': 1.0,
-                        'dictionary_id': entry.id
-                    })
-                # Synonym match
-                elif entry.synonyms and any(entity_text.lower() == syn.lower() for syn in entry.synonyms):
-                    matches.append({
-                        'type': 'dictionary_term',
-                        'name': entry.term,
-                        'definition': entry.definition,
-                        'synonyms': entry.synonyms,
-                        'match_type': 'synonym',
-                        'confidence': 0.9,
-                        'dictionary_id': entry.id
-                    })
-        
-        # Sort by confidence
-        matches.sort(key=lambda x: x['confidence'], reverse=True)
-        
-        return matches[:10]  # Return top 10 matches
-    
-    def _rank_mappings(self, mappings: List[Dict], project_id: int) -> List[Dict]:
-        """Rank entity mappings by relevance and confidence"""
-        weights = Config.ENTITY_CONFIG['ranking_weights']
-        
-        for mapping in mappings:
-            total_score = 0.0
-            
-            for match in mapping['matches']:
-                score = match['confidence']
-                
-                # Apply weights based on match type
-                if match['match_type'] == 'exact':
-                    score *= weights['exact_match']
-                elif match['match_type'] == 'fuzzy':
-                    score *= weights['fuzzy_match']
-                
-                # Boost table matches
-                if match['type'] == 'table':
-                    score *= weights['table_importance']
-                
-                match['weighted_score'] = round(score, 3)
-                total_score += score
-            
-            mapping['total_score'] = round(total_score, 3)
-        
-        # Sort by total score
-        mappings.sort(key=lambda x: x['total_score'], reverse=True)
-        
-        return mappings
+            return {'tables': [], 'columns': [], 'dictionary_terms': []}
     
     def _call_llm(self, prompt: str, max_tokens: int = 1000) -> str:
         """Call Azure OpenAI LLM"""
@@ -503,129 +354,285 @@ class ChatService:
             response = self.client.chat.completions.create(
                 model=self.deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert data analyst and SQL developer."},
-                    {"role": "user", "content": prompt}
+                    {
+                        "role": "system",
+                        "content": "You are a helpful AI assistant that converts natural language to SQL and helps analyze data."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
                 ],
                 max_tokens=max_tokens,
-                temperature=0.1,
-                top_p=0.9
+                temperature=0.1
             )
             
             return response.choices[0].message.content.strip()
             
         except Exception as e:
             logger.error(f"Error calling LLM: {str(e)}")
-            raise Exception(f"LLM call failed: {str(e)}")
+            raise
     
-    def _validate_and_enhance_entities(self, entities_raw: List[Dict], project_id: int) -> List[Dict]:
-        """Validate and enhance extracted entities"""
-        enhanced_entities = []
-        
-        for entity in entities_raw:
-            if isinstance(entity, dict) and 'entity' in entity:
-                enhanced = {
-                    'entity': entity['entity'].strip(),
-                    'type': entity.get('type', 'unknown'),
-                    'confidence': round(float(entity.get('confidence', 0.5)), 3)
-                }
-                
-                # Filter out very low confidence entities
-                if enhanced['confidence'] >= self.entity_confidence_threshold:
-                    enhanced_entities.append(enhanced)
-        
-        # Limit number of entities
-        return enhanced_entities[:self.max_entities]
-    
-    def _fallback_entity_extraction(self, query: str, project_id: int) -> List[Dict]:
-        """Fallback entity extraction using regex and keyword matching"""
+    def _extract_entities_fallback(self, query: str, context: Dict) -> List[Dict]:
+        """Fallback entity extraction using pattern matching"""
         entities = []
+        query_lower = query.lower()
         
-        # Simple keyword extraction
-        words = re.findall(r'\b\w+\b', query.lower())
-        
-        # Get project context for matching
-        context = self._build_project_context(project_id)
-        
-        # Match against table names
+        # Look for table names
         for table in context['tables']:
             table_name = table['name'].lower()
-            if table_name in words or any(word in table_name for word in words):
+            if table_name in query_lower:
                 entities.append({
-                    'entity': table['name'],
+                    'text': table['name'],
                     'type': 'table',
-                    'confidence': 0.8
+                    'confidence': 0.8,
+                    'position': query_lower.find(table_name)
                 })
         
-        # Match against column names
+        # Look for column names
         for column in context['columns']:
-            column_name = column['name'].lower()
-            if column_name in words or any(word in column_name for word in words):
+            col_name = column['name'].lower()
+            if col_name in query_lower:
                 entities.append({
-                    'entity': column['name'],
+                    'text': column['name'],
                     'type': 'column',
-                    'confidence': 0.7
+                    'confidence': 0.7,
+                    'position': query_lower.find(col_name)
                 })
         
-        return entities[:10]
+        # Look for dictionary terms
+        for term in context['dictionary_terms']:
+            term_text = term['term'].lower()
+            if term_text in query_lower:
+                entities.append({
+                    'text': term['term'],
+                    'type': 'business_term',
+                    'confidence': 0.6,
+                    'position': query_lower.find(term_text)
+                })
+        
+        # Remove duplicates and sort by confidence
+        unique_entities = []
+        seen = set()
+        
+        for entity in sorted(entities, key=lambda x: x['confidence'], reverse=True):
+            if entity['text'] not in seen:
+                unique_entities.append(entity)
+                seen.add(entity['text'])
+        
+        return unique_entities[:self.max_entities]
     
-    def _fallback_sql_extraction(self, response: str) -> Dict[str, Any]:
-        """Extract SQL from text response when JSON parsing fails"""
-        # Look for SQL in code blocks or after certain keywords
-        sql_patterns = [
-            r'```sql\s*(.*?)\s*```',
-            r'```\s*(SELECT.*?)\s*```',
-            r'SQL:\s*(SELECT.*?)(?:\n|$)',
-            r'(SELECT.*?)(?:\n|$)'
+    def _validate_entities(self, entities: List[Dict], context: Dict) -> List[Dict]:
+        """Validate and enhance extracted entities"""
+        validated = []
+        
+        if not isinstance(entities, list):
+            return []
+        
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+                
+            # Ensure required fields
+            if 'text' not in entity:
+                continue
+                
+            # Set defaults
+            entity.setdefault('type', 'unknown')
+            entity.setdefault('confidence', 0.5)
+            
+            # Validate confidence is a number
+            try:
+                entity['confidence'] = float(entity['confidence'])
+            except (ValueError, TypeError):
+                entity['confidence'] = 0.5
+            
+            # Filter by confidence threshold
+            if entity['confidence'] >= self.entity_confidence_threshold:
+                validated.append(entity)
+        
+        return validated[:self.max_entities]
+    
+    def _calculate_similarity(self, text1: str, text2: str) -> float:
+        """Calculate similarity between two text strings"""
+        if not text1 or not text2:
+            return 0.0
+        
+        # Use fuzzy string matching
+        return fuzz.ratio(text1, text2) / 100.0
+    
+    def _build_schema_context(self, mappings: List[Dict], project_id: int) -> Dict[str, Any]:
+        """Build schema context for SQL generation"""
+        try:
+            schema_info = []
+            table_names = set()
+            
+            for mapping in mappings:
+                table_name = mapping['table']
+                table_names.add(table_name)
+                
+                if mapping['column']:
+                    schema_info.append(f"{table_name}.{mapping['column']} ({mapping.get('data_type', 'unknown')})")
+                else:
+                    schema_info.append(f"{table_name} (table)")
+            
+            # Get additional table information
+            tables = Table.query.join(DataSource).filter(
+                DataSource.project_id == project_id,
+                Table.name.in_(table_names)
+            ).all()
+            
+            relationships = []
+            for table in tables:
+                # Get foreign key relationships (simplified)
+                for column in table.columns:
+                    if column.is_foreign_key:
+                        relationships.append(f"{table.name}.{column.name} references another table")
+            
+            return {
+                'schema': '\n'.join(schema_info),
+                'relationships': '\n'.join(relationships) if relationships else 'No explicit relationships found'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error building schema context: {str(e)}")
+            return {'schema': '', 'relationships': ''}
+    
+    def _validate_and_enhance_sql(self, sql_result: Dict, mappings: List[Dict]) -> Dict[str, Any]:
+        """Validate and enhance SQL result"""
+        try:
+            sql = sql_result.get('sql', '')
+            
+            # Basic SQL validation
+            if not sql or not sql.strip():
+                sql_result['confidence'] = 0.0
+                sql_result['error'] = 'No SQL generated'
+                return sql_result
+            
+            # Check if SQL contains mapped tables/columns
+            sql_lower = sql.lower()
+            mapped_tables = set(mapping['table'].lower() for mapping in mappings)
+            
+            table_matches = sum(1 for table in mapped_tables if table in sql_lower)
+            
+            # Adjust confidence based on table matches
+            if table_matches > 0:
+                original_confidence = sql_result.get('confidence', 0.5)
+                boost = min(0.3, table_matches * 0.1)
+                sql_result['confidence'] = min(1.0, original_confidence + boost)
+            
+            # Add metadata
+            sql_result['tables_used'] = list(mapped_tables)
+            sql_result['table_matches'] = table_matches
+            
+            return sql_result
+            
+        except Exception as e:
+            logger.error(f"Error validating SQL: {str(e)}")
+            sql_result['confidence'] = 0.0
+            sql_result['error'] = str(e)
+            return sql_result
+    
+    def _is_sql_safe(self, sql: str) -> bool:
+        """Check if SQL query is safe to execute"""
+        sql_upper = sql.upper().strip()
+        
+        # Only allow SELECT statements
+        if not sql_upper.startswith('SELECT'):
+            return False
+        
+        # Forbidden keywords/operations
+        forbidden = [
+            'DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE',
+            'TRUNCATE', 'GRANT', 'REVOKE', 'EXEC', 'EXECUTE',
+            'MERGE', 'BULK', 'OPENROWSET', 'OPENDATASOURCE'
         ]
         
-        sql_query = ""
-        for pattern in sql_patterns:
-            match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
-            if match:
-                sql_query = match.group(1).strip()
-                break
-        
-        return {
-            'sql': sql_query,
-            'rationale': 'Generated using fallback extraction',
-            'confidence': 0.6,
-            'tables_used': [],
-            'assumptions': ['Response parsing failed, used fallback extraction']
-        }
-    
-    def _validate_and_clean_sql(self, sql_query: str) -> str:
-        """Validate and clean SQL query"""
-        if not sql_query:
-            return sql_query
-        
-        # Remove common issues
-        sql_query = sql_query.strip()
-        
-        # Remove trailing semicolon if present
-        if sql_query.endswith(';'):
-            sql_query = sql_query[:-1]
-        
-        # Ensure it starts with SELECT
-        if not sql_query.upper().startswith('SELECT'):
-            raise Exception("Only SELECT queries are allowed")
-        
-        return sql_query
-    
-    def _is_sql_safe(self, sql_query: str) -> bool:
-        """Check if SQL query is safe to execute"""
-        sql_upper = sql_query.upper()
-        
-        # Check for allowed statements
-        allowed = Config.SQL_CONFIG['allowed_statements']
-        if not any(sql_upper.strip().startswith(stmt) for stmt in allowed):
-            return False
-        
-        # Check for blocked keywords
-        blocked = Config.SQL_CONFIG['blocked_keywords']
-        if any(keyword in sql_upper for keyword in blocked):
-            return False
+        for keyword in forbidden:
+            if keyword in sql_upper:
+                return False
         
         return True
+    
+    def _extract_sql_from_text(self, text: str) -> str:
+        """Extract SQL from text response"""
+        # Look for SQL patterns
+        sql_patterns = [
+            r'SELECT\s+.*?(?=\n\n|\n$|$)',
+            r'select\s+.*?(?=\n\n|\n$|$)'
+        ]
+        
+        for pattern in sql_patterns:
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                return match.group(0).strip()
+        
+        return text.strip()
+    
+    def _execute_on_file_sources(self, sql: str, project_id: int) -> Dict[str, Any]:
+        """Execute SQL on file-based data sources (create temporary SQLite DB)"""
+        try:
+            import sqlite3
+            import pandas as pd
+            import tempfile
+            
+            # Create temporary SQLite database
+            temp_db = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
+            conn = sqlite3.connect(temp_db.name)
+            
+            # Load data from file sources into SQLite
+            data_sources = DataSource.query.filter_by(
+                project_id=project_id,
+                type='file'
+            ).all()
+            
+            for source in data_sources:
+                for table in source.tables:
+                    try:
+                        # Read file data
+                        if source.subtype == 'csv':
+                            df = pd.read_csv(source.file_path)
+                        elif source.subtype in ['xlsx', 'xls']:
+                            df = pd.read_excel(source.file_path)
+                        else:
+                            continue
+                        
+                        # Store in SQLite
+                        df.to_sql(table.name, conn, if_exists='replace', index=False)
+                        
+                    except Exception as e:
+                        logger.warning(f"Error loading table {table.name}: {str(e)}")
+                        continue
+            
+            # Execute SQL
+            start_time = time.time()
+            result_df = pd.read_sql_query(sql, conn)
+            execution_time = time.time() - start_time
+            
+            # Convert to dict format
+            data = result_df.to_dict('records')
+            columns = list(result_df.columns)
+            
+            # Cleanup
+            conn.close()
+            os.unlink(temp_db.name)
+            
+            return {
+                'success': True,
+                'data': data,
+                'columns': columns,
+                'row_count': len(data),
+                'execution_time_seconds': round(execution_time, 3),
+                'sql': sql
+            }
+            
+        except Exception as e:
+            logger.error(f"Error executing SQL on file sources: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'sql': sql
+            }
     
     def _build_connection_string(self, config: Dict[str, Any]) -> str:
         """Build database connection string"""
@@ -644,52 +651,4 @@ class ChatService:
             return f"sqlite:///{database}"
         else:
             raise ValueError(f"Unsupported database type: {db_type}")
-    
-    def _execute_on_file_data(self, sql_query: str, project_id: int) -> Dict[str, Any]:
-        """Execute SQL on file-based data using SQLite in-memory database"""
-        # This is a placeholder for executing queries on file data
-        # In a full implementation, you would:
-        # 1. Create an in-memory SQLite database
-        # 2. Load file data into tables
-        # 3. Execute the query
-        
-        return {
-            'success': False,
-            'error': 'File-based SQL execution not implemented yet',
-            'execution_time_ms': 0,
-            'sql_query': sql_query
-        }
-    
-    def _build_sql_generation_context(self, mappings: List[Dict], project_id: int) -> Dict[str, Any]:
-        """Build context specifically for SQL generation"""
-        schemas = []
-        
-        # Get unique table IDs from mappings
-        table_ids = set()
-        for mapping in mappings:
-            for match in mapping['matches']:
-                if match['type'] in ['table', 'column'] and 'table_id' in match:
-                    table_ids.add(match['table_id'])
-        
-        # Build schema for each relevant table
-        for table_id in table_ids:
-            table = Table.query.get(table_id)
-            if table:
-                schema = {
-                    'table': table.name,
-                    'description': table.description,
-                    'columns': []
-                }
-                
-                for column in table.columns:
-                    schema['columns'].append({
-                        'name': column.name,
-                        'type': column.data_type,
-                        'description': column.description,
-                        'nullable': column.is_nullable,
-                        'primary_key': column.is_primary_key
-                    })
-                
-                schemas.append(schema)
-        
-        return {'schemas': schemas}
+        return None

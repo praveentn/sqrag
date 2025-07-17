@@ -14,12 +14,12 @@ class Project(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(255), nullable=False)
     description = db.Column(Text)
-    owner = db.Column(db.String(100), nullable=False)
+    owner = db.Column(db.String(100), nullable=False, default='default_user')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     status = db.Column(db.String(50), default='active')  # active, archived, deleted
     
-    # Relationships
+    # Relationships - Fixed naming
     sources = db.relationship('DataSource', backref='project', lazy=True, cascade='all, delete-orphan')
     dictionary_entries = db.relationship('DictionaryEntry', backref='project', lazy=True, cascade='all, delete-orphan')
     embeddings = db.relationship('Embedding', backref='project', lazy=True, cascade='all, delete-orphan')
@@ -57,7 +57,7 @@ class DataSource(db.Model):
     file_path = db.Column(db.String(500))
     file_size = db.Column(db.BigInteger)
     
-    # Status tracking
+    # Status tracking - Keep original column names to match existing DB
     ingest_status = db.Column(db.String(50), default='pending')  # pending, processing, completed, failed
     ingest_progress = db.Column(db.Float, default=0.0)  # 0.0 to 1.0
     error_message = db.Column(Text)
@@ -67,6 +67,23 @@ class DataSource(db.Model):
     
     # Relationships
     tables = db.relationship('Table', backref='source', lazy=True, cascade='all, delete-orphan')
+    
+    # Property to provide consistent interface
+    @property
+    def status(self):
+        return self.ingest_status
+    
+    @status.setter
+    def status(self, value):
+        self.ingest_status = value
+    
+    @property
+    def progress(self):
+        return self.ingest_progress
+    
+    @progress.setter
+    def progress(self, value):
+        self.ingest_progress = value
     
     def to_dict(self):
         return {
@@ -78,8 +95,8 @@ class DataSource(db.Model):
             'connection_config': self.connection_config,
             'file_path': self.file_path,
             'file_size': self.file_size,
-            'ingest_status': self.ingest_status,
-            'ingest_progress': round(self.ingest_progress, 3) if self.ingest_progress else 0.0,
+            'status': self.ingest_status,  # Use the actual column name
+            'progress': round(self.ingest_progress, 3) if self.ingest_progress else 0.0,
             'error_message': self.error_message,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'tables_count': len(self.tables)
@@ -123,7 +140,7 @@ class Table(db.Model):
             'completeness_score': round(self.completeness_score, 3) if self.completeness_score else None,
             'quality_score': round(self.quality_score, 3) if self.quality_score else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
-            'columns': [col.to_dict() for col in self.columns]
+            'columns_count': len(self.columns)
         }
 
 class Column(db.Model):
@@ -136,14 +153,14 @@ class Column(db.Model):
     display_name = db.Column(db.String(255))
     description = db.Column(Text)
     
-    # Technical metadata
+    # Data type and constraints
     data_type = db.Column(db.String(100))
     is_nullable = db.Column(db.Boolean, default=True)
     is_primary_key = db.Column(db.Boolean, default=False)
     is_foreign_key = db.Column(db.Boolean, default=False)
     foreign_key_ref = db.Column(db.String(255))  # table.column reference
     
-    # Data profiling
+    # Data statistics
     distinct_count = db.Column(db.BigInteger)
     null_count = db.Column(db.BigInteger)
     min_value = db.Column(db.String(255))
@@ -151,7 +168,7 @@ class Column(db.Model):
     avg_value = db.Column(db.Float)
     sample_values = db.Column(JSON)  # Array of sample values
     
-    # Classification
+    # Data classification
     pii_flag = db.Column(db.Boolean, default=False)
     sensitivity_level = db.Column(db.String(50))  # public, internal, confidential, restricted
     business_category = db.Column(db.String(100))  # finance, hr, sales, etc.
@@ -332,72 +349,64 @@ class Index(db.Model):
         }
 
 class SearchLog(db.Model):
-    """Search query logs for analytics"""
+    """Search activity logs"""
     __tablename__ = 'search_logs'
     
     id = db.Column(db.Integer, primary_key=True)
     project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
     
-    # Query details
-    query_text = db.Column(Text, nullable=False)
-    query_type = db.Column(db.String(50))  # keyword, semantic, hybrid
-    index_id = db.Column(db.Integer, db.ForeignKey('indexes.id'))
+    query = db.Column(Text, nullable=False)
+    search_type = db.Column(db.String(50))  # semantic, keyword, hybrid
+    result_count = db.Column(db.Integer)
     
-    # Results metadata
-    results_count = db.Column(db.Integer, default=0)
-    top_score = db.Column(db.Float)
-    response_time_ms = db.Column(db.Float)
+    # Performance metrics
+    search_time_seconds = db.Column(db.Float)
     
     # Context
     user_id = db.Column(db.String(100))
-    session_id = db.Column(db.String(255))
+    session_id = db.Column(db.String(100))
     
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     
     def to_dict(self):
         return {
             'id': self.id,
             'project_id': self.project_id,
-            'query_text': self.query_text,
-            'query_type': self.query_type,
-            'index_id': self.index_id,
-            'results_count': self.results_count,
-            'top_score': round(self.top_score, 3) if self.top_score else None,
-            'response_time_ms': round(self.response_time_ms, 2) if self.response_time_ms else None,
+            'query': self.query,
+            'search_type': self.search_type,
+            'result_count': self.result_count,
+            'search_time_seconds': round(self.search_time_seconds, 3) if self.search_time_seconds else None,
             'user_id': self.user_id,
             'session_id': self.session_id,
-            'created_at': self.created_at.isoformat() if self.created_at else None
+            'timestamp': self.timestamp.isoformat() if self.timestamp else None
         }
 
 class NLQFeedback(db.Model):
-    """Natural Language Query feedback for model improvement"""
+    """Natural Language Query feedback"""
     __tablename__ = 'nlq_feedback'
     
     id = db.Column(db.Integer, primary_key=True)
     project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
     
-    # Query pipeline data
-    nlq_text = db.Column(Text, nullable=False)
+    # Original query and context
+    user_query = db.Column(Text, nullable=False)
     extracted_entities = db.Column(JSON)
-    mapped_tables = db.Column(JSON)
     generated_sql = db.Column(Text)
-    sql_results = db.Column(JSON)
     
     # User feedback
-    rating = db.Column(db.Integer)  # 1-5 stars
-    feedback_type = db.Column(db.String(50))  # entity_mapping, sql_generation, results
-    comment = db.Column(Text)
+    feedback_type = db.Column(db.String(50))  # thumbs_up, thumbs_down, correction
+    feedback_text = db.Column(Text)
+    correct_sql = db.Column(Text)  # If user provides correction
     
-    # Pipeline performance
+    # Performance metrics
     entity_extraction_time_ms = db.Column(db.Float)
-    mapping_time_ms = db.Column(db.Float)
     sql_generation_time_ms = db.Column(db.Float)
     sql_execution_time_ms = db.Column(db.Float)
     total_time_ms = db.Column(db.Float)
     
     # Context
     user_id = db.Column(db.String(100))
-    session_id = db.Column(db.String(255))
+    session_id = db.Column(db.String(100))
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
@@ -405,16 +414,13 @@ class NLQFeedback(db.Model):
         return {
             'id': self.id,
             'project_id': self.project_id,
-            'nlq_text': self.nlq_text,
+            'user_query': self.user_query,
             'extracted_entities': self.extracted_entities,
-            'mapped_tables': self.mapped_tables,
             'generated_sql': self.generated_sql,
-            'sql_results': self.sql_results,
-            'rating': self.rating,
             'feedback_type': self.feedback_type,
-            'comment': self.comment,
+            'feedback_text': self.feedback_text,
+            'correct_sql': self.correct_sql,
             'entity_extraction_time_ms': round(self.entity_extraction_time_ms, 2) if self.entity_extraction_time_ms else None,
-            'mapping_time_ms': round(self.mapping_time_ms, 2) if self.mapping_time_ms else None,
             'sql_generation_time_ms': round(self.sql_generation_time_ms, 2) if self.sql_generation_time_ms else None,
             'sql_execution_time_ms': round(self.sql_execution_time_ms, 2) if self.sql_execution_time_ms else None,
             'total_time_ms': round(self.total_time_ms, 2) if self.total_time_ms else None,

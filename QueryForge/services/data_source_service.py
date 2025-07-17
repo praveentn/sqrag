@@ -5,6 +5,7 @@ import sqlalchemy
 from sqlalchemy import create_engine, text, inspect
 import json
 import logging
+import re
 from typing import Dict, List, Any, Optional
 import traceback
 
@@ -50,8 +51,11 @@ class DataSourceService:
     def _process_csv(self, source: DataSource, file_path: str) -> int:
         """Process CSV file"""
         try:
-            # Read CSV with pandas
-            df = pd.read_csv(file_path)
+            # Read CSV with pandas, better type inference
+            df = pd.read_csv(file_path, encoding='utf-8')
+            
+            # Improve data type inference
+            df = self._improve_data_types(df)
             
             # Create table name from filename
             table_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -93,6 +97,9 @@ class DataSourceService:
                 # Skip empty sheets
                 if df.empty:
                     continue
+                
+                # Improve data type inference
+                df = self._improve_data_types(df)
                 
                 # Create table name from filename and sheet
                 base_name = os.path.splitext(os.path.basename(file_path))[0]
@@ -139,6 +146,9 @@ class DataSourceService:
             else:
                 raise ValueError("Unsupported JSON structure")
             
+            # Improve data type inference
+            df = self._improve_data_types(df)
+            
             # Create table name from filename
             table_name = os.path.splitext(os.path.basename(file_path))[0]
             
@@ -165,6 +175,69 @@ class DataSourceService:
         except Exception as e:
             db.session.rollback()
             raise Exception(f"Error processing JSON file: {str(e)}")
+    
+    def _improve_data_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Improve data type inference for better accuracy"""
+        df_improved = df.copy()
+        
+        for col in df_improved.columns:
+            series = df_improved[col]
+            
+            # Skip if already numeric
+            if pd.api.types.is_numeric_dtype(series):
+                continue
+            
+            # Try to convert to numeric
+            try:
+                # Remove common non-numeric characters
+                cleaned_series = series.astype(str).str.replace(r'[\$,%]', '', regex=True)
+                numeric_series = pd.to_numeric(cleaned_series, errors='coerce')
+                
+                # If more than 80% of values are numeric, convert
+                non_null_count = series.dropna().shape[0]
+                numeric_count = numeric_series.dropna().shape[0]
+                
+                if non_null_count > 0 and (numeric_count / non_null_count) > 0.8:
+                    df_improved[col] = numeric_series
+                    continue
+            except:
+                pass
+            
+            # Try to convert to datetime
+            try:
+                datetime_series = pd.to_datetime(series, errors='coerce', infer_datetime_format=True)
+                non_null_count = series.dropna().shape[0]
+                datetime_count = datetime_series.dropna().shape[0]
+                
+                if non_null_count > 0 and (datetime_count / non_null_count) > 0.8:
+                    df_improved[col] = datetime_series
+                    continue
+            except:
+                pass
+            
+            # Try to convert to boolean
+            if series.dtype == 'object':
+                unique_values = series.dropna().str.lower().unique()
+                bool_values = {'true', 'false', 'yes', 'no', '1', '0', 'y', 'n'}
+                
+                if len(unique_values) <= 2 and all(val in bool_values for val in unique_values):
+                    boolean_map = {
+                        'true': True, 'false': False, 'yes': True, 'no': False,
+                        '1': True, '0': False, 'y': True, 'n': False
+                    }
+                    df_improved[col] = series.str.lower().map(boolean_map)
+                    continue
+            
+            # Try to identify categorical data
+            if series.dtype == 'object':
+                unique_count = series.nunique()
+                total_count = len(series.dropna())
+                
+                # If less than 10% unique values and more than 10 rows, make it categorical
+                if total_count > 10 and unique_count / total_count < 0.1:
+                    df_improved[col] = series.astype('category')
+        
+        return df_improved
     
     def _extract_schema(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Extract schema information from DataFrame"""
@@ -198,7 +271,7 @@ class DataSourceService:
     
     def _create_column_from_series(self, table_id: int, col_name: str, series: pd.Series) -> Column:
         """Create Column object from pandas Series"""
-        # Infer data type
+        # Infer data type with improved logic
         dtype = str(series.dtype)
         python_type = self._map_pandas_dtype_to_sql(dtype)
         
@@ -218,7 +291,7 @@ class DataSourceService:
         if pd.api.types.is_numeric_dtype(series):
             min_value = str(series.min()) if not pd.isna(series.min()) else None
             max_value = str(series.max()) if not pd.isna(series.max()) else None
-            avg_value = float(series.mean()) if not pd.isna(series.mean()) else None
+            avg_value = round(float(series.mean()), 3) if not pd.isna(series.mean()) else None
         
         # Detect PII
         pii_flag = self._detect_pii(col_name, sample_values)
@@ -240,18 +313,28 @@ class DataSourceService:
         )
     
     def _map_pandas_dtype_to_sql(self, pandas_dtype: str) -> str:
-        """Map pandas dtype to SQL data type"""
-        mapping = {
-            'int64': 'INTEGER',
-            'int32': 'INTEGER',
-            'float64': 'FLOAT',
-            'float32': 'FLOAT',
-            'object': 'VARCHAR',
-            'bool': 'BOOLEAN',
-            'datetime64[ns]': 'TIMESTAMP',
-            'category': 'VARCHAR'
-        }
-        return mapping.get(pandas_dtype.lower(), 'VARCHAR')
+        """Map pandas dtype to SQL data type with improved accuracy"""
+        dtype_lower = pandas_dtype.lower()
+        
+        # More specific mapping
+        if 'int' in dtype_lower:
+            return 'INTEGER'
+        elif 'float' in dtype_lower:
+            return 'FLOAT'
+        elif 'bool' in dtype_lower:
+            return 'BOOLEAN'
+        elif 'datetime' in dtype_lower or 'timestamp' in dtype_lower:
+            return 'TIMESTAMP'
+        elif 'date' in dtype_lower:
+            return 'DATE'
+        elif 'time' in dtype_lower:
+            return 'TIME'
+        elif 'category' in dtype_lower:
+            return 'VARCHAR'  # Categorical treated as string
+        elif 'object' in dtype_lower:
+            return 'TEXT'  # Changed from VARCHAR to TEXT for better handling
+        else:
+            return 'TEXT'  # Default fallback
     
     def _detect_pii(self, col_name: str, sample_values: List[str]) -> bool:
         """Detect if column might contain PII"""
@@ -282,11 +365,13 @@ class DataSourceService:
     def _infer_business_category(self, col_name: str) -> Optional[str]:
         """Infer business category from column name"""
         categories = {
-            'finance': ['amount', 'price', 'cost', 'revenue', 'profit', 'budget', 'expense'],
+            'finance': ['amount', 'price', 'cost', 'revenue', 'profit', 'budget', 'expense', 'total', 'sum'],
             'hr': ['employee', 'salary', 'department', 'manager', 'hire', 'termination'],
             'sales': ['customer', 'order', 'product', 'quantity', 'discount', 'commission'],
             'marketing': ['campaign', 'lead', 'conversion', 'impression', 'click'],
-            'operations': ['inventory', 'supply', 'vendor', 'shipping', 'delivery']
+            'operations': ['inventory', 'supply', 'vendor', 'shipping', 'delivery'],
+            'temporal': ['date', 'time', 'created', 'updated', 'modified', 'timestamp'],
+            'identifier': ['id', 'key', 'code', 'number', 'ref', 'reference']
         }
         
         col_lower = col_name.lower()

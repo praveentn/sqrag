@@ -1,274 +1,236 @@
 # services/search_service.py
 import numpy as np
-import time
+import json
 import logging
+import time
 from typing import Dict, List, Any, Optional, Tuple
-from fuzzywuzzy import fuzz
-from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
+from datetime import datetime
 import pickle
 import faiss
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 
 from config import Config
-from models import db, Index, SearchLog, Table, Column, DictionaryEntry, Project
+from models import db, Project, Table, Column, DictionaryEntry, Embedding, Index, SearchLog
 from services.embedding_service import EmbeddingService
 
 logger = logging.getLogger(__name__)
 
 class SearchService:
-    """Service for performing searches across different index types"""
+    """Service for performing searches across multiple index types"""
     
     def __init__(self):
         self.embedding_service = EmbeddingService()
+        self.loaded_indexes = {}  # Cache for loaded indexes
         self.sentence_model = None
         self._init_sentence_transformer()
     
     def _init_sentence_transformer(self):
-        """Initialize sentence transformer for query embedding"""
+        """Initialize sentence transformer for query encoding"""
         try:
-            model_name = Config.EMBEDDING_CONFIG['default_model']
-            self.sentence_model = SentenceTransformer(model_name)
-            logger.info("Search service initialized with sentence transformer")
+            default_model = Config.EMBEDDING_CONFIG['default_model']
+            self.sentence_model = SentenceTransformer(default_model)
+            logger.info(f"Loaded sentence transformer: {default_model}")
         except Exception as e:
-            logger.warning(f"Failed to initialize sentence transformer: {str(e)}")
+            logger.warning(f"Failed to load sentence transformer: {str(e)}")
     
-    def search(self, query: str, index_id: Optional[int] = None, 
-               search_type: str = 'hybrid', top_k: int = 10, 
-               project_id: Optional[int] = None) -> Dict[str, Any]:
-        """Perform search across indexes"""
+    def search(self, query: str, project_id: int, search_params: Optional[Dict] = None) -> Dict[str, Any]:
+        """
+        Perform search across project indexes
+        
+        Args:
+            query: Search query string
+            project_id: Project ID for search scope
+            search_params: Optional search parameters
+                - index_ids: List of specific index IDs to search
+                - top_k: Number of results to return (default: 10)
+                - min_score: Minimum similarity score threshold
+                - search_type: 'semantic', 'keyword', or 'hybrid'
+        """
         start_time = time.time()
         
+        if not project_id:
+            raise ValueError("Project ID required for search")
+        
+        # Validate project exists
+        project = Project.query.get(project_id)
+        if not project:
+            raise ValueError(f"Project {project_id} not found")
+        
+        # Default search parameters
+        search_params = search_params or {}
+        top_k = search_params.get('top_k', 10)
+        min_score = search_params.get('min_score', 0.1)
+        search_type = search_params.get('search_type', 'hybrid')
+        index_ids = search_params.get('index_ids')
+        
         try:
-            if index_id:
-                # Search specific index
-                results = self._search_single_index(query, index_id, search_type, top_k)
+            # Get available indexes for project
+            if index_ids:
+                indexes = Index.query.filter(
+                    Index.id.in_(index_ids),
+                    Index.project_id == project_id,
+                    Index.status == 'ready'
+                ).all()
             else:
-                # Search across all relevant indexes
-                results = self._search_all_indexes(query, project_id, search_type, top_k)
+                indexes = Index.query.filter_by(
+                    project_id=project_id,
+                    status='ready'
+                ).all()
             
-            search_time_ms = round((time.time() - start_time) * 1000, 2)
+            if not indexes:
+                return {
+                    'results': [],
+                    'total_results': 0,
+                    'search_time': time.time() - start_time,
+                    'message': 'No ready indexes found for this project'
+                }
+            
+            # Perform search across all available indexes
+            all_results = []
+            
+            for index in indexes:
+                try:
+                    index_results = self._search_single_index(
+                        query, index, top_k, min_score, search_type
+                    )
+                    all_results.extend(index_results)
+                except Exception as e:
+                    logger.warning(f"Error searching index {index.id}: {str(e)}")
+                    continue
+            
+            # Merge and rank results
+            final_results = self._merge_and_rank_results(all_results, top_k)
             
             # Log search
-            if project_id:
-                self._log_search(query, index_id, search_type, results, search_time_ms, project_id)
+            self._log_search(query, project_id, len(final_results), time.time() - start_time)
             
             return {
-                'query': query,
-                'search_type': search_type,
-                'results': results,
-                'total_results': len(results),
-                'search_time_ms': search_time_ms,
-                'index_id': index_id
+                'results': final_results,
+                'total_results': len(final_results),
+                'search_time': round(time.time() - start_time, 3),
+                'indexes_searched': len(indexes),
+                'query': query
             }
             
         except Exception as e:
-            logger.error(f"Search error: {str(e)}")
+            logger.error(f"Search failed for project {project_id}: {str(e)}")
             raise Exception(f"Search failed: {str(e)}")
     
-    def _search_single_index(self, query: str, index_id: int, 
-                           search_type: str, top_k: int) -> List[Dict[str, Any]]:
-        """Search within a single index"""
-        index_record = Index.query.get(index_id)
-        if not index_record or index_record.status != 'ready':
-            raise ValueError(f"Index {index_id} not ready")
-        
-        # Load index
-        index_data = self.embedding_service.load_index(index_id)
-        
-        # Perform search based on index type and search type
-        if index_data['type'] == 'faiss':
-            return self._search_faiss_index(query, index_data, search_type, top_k)
-        elif index_data['type'] in ['tfidf', 'bm25']:
-            return self._search_text_index(query, index_data, search_type, top_k)
-        else:
-            raise ValueError(f"Unsupported index type: {index_data['type']}")
-    
-    def _search_all_indexes(self, query: str, project_id: int, 
-                          search_type: str, top_k: int) -> List[Dict[str, Any]]:
-        """Search across all indexes for a project"""
-        if not project_id:
-            raise ValueError("Project ID required for multi-index search")
-        
-        # Get all ready indexes for the project
-        indexes = Index.query.filter_by(
-            project_id=project_id,
-            status='ready'
-        ).all()
-        
-        if not indexes:
+    def _search_single_index(self, query: str, index: Index, top_k: int, 
+                           min_score: float, search_type: str) -> List[Dict]:
+        """Search a single index"""
+        try:
+            # Load index if not cached
+            if index.id not in self.loaded_indexes:
+                index_data = self.embedding_service.load_index(index.id)
+                self.loaded_indexes[index.id] = index_data
+            else:
+                index_data = self.loaded_indexes[index.id]
+            
+            # Perform search based on index type
+            if index_data['type'] == 'faiss':
+                return self._search_faiss_index(query, index_data, top_k, min_score)
+            elif index_data['type'] == 'tfidf':
+                return self._search_tfidf_index(query, index_data, top_k, min_score)
+            elif index_data['type'] == 'bm25':
+                return self._search_bm25_index(query, index_data, top_k, min_score)
+            else:
+                logger.warning(f"Unsupported index type: {index_data['type']}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"Error searching index {index.id}: {str(e)}")
             return []
-        
-        all_results = []
-        
-        # Search each index
-        for index_record in indexes:
-            try:
-                index_results = self._search_single_index(
-                    query, index_record.id, search_type, top_k
-                )
-                
-                # Add index metadata to results
-                for result in index_results:
-                    result['index_id'] = index_record.id
-                    result['index_name'] = index_record.name
-                    result['index_type'] = index_record.index_type
-                
-                all_results.extend(index_results)
-                
-            except Exception as e:
-                logger.warning(f"Error searching index {index_record.id}: {str(e)}")
-                continue
-        
-        # Merge and rank results
-        merged_results = self._merge_and_rank_results(all_results, query, top_k)
-        
-        return merged_results
     
     def _search_faiss_index(self, query: str, index_data: Dict, 
-                           search_type: str, top_k: int) -> List[Dict[str, Any]]:
+                          top_k: int, min_score: float) -> List[Dict]:
         """Search FAISS vector index"""
         if not self.sentence_model:
-            raise ValueError("Sentence transformer not available for FAISS search")
+            raise ValueError("Sentence transformer not available for vector search")
         
-        # Embed query
-        query_vector = self.sentence_model.encode([query])[0].astype('float32')
+        # Encode query
+        query_vector = self.sentence_model.encode([query]).astype('float32')
         
-        # Normalize for cosine similarity if using IndexFlatIP
-        if index_data['metadata']['index_type'] == 'IndexFlatIP':
-            faiss.normalize_L2(query_vector.reshape(1, -1))
+        # Normalize for cosine similarity
+        faiss.normalize_L2(query_vector)
         
         # Search
-        faiss_index = index_data['index']
-        scores, indices = faiss_index.search(query_vector.reshape(1, -1), top_k)
+        scores, indices = index_data['index'].search(query_vector, top_k)
         
-        # Build results
         results = []
         metadata = index_data['metadata']
         
         for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
-            if idx == -1:  # FAISS returns -1 for not found
+            if idx == -1 or score < min_score:  # FAISS returns -1 for invalid results
                 continue
-            
-            result = {
-                'rank': i + 1,
-                'score': float(score),
-                'similarity': float(score),  # For FAISS, score is similarity
-                'object_type': metadata['object_types'][idx],
-                'object_id': metadata['object_ids'][idx],
-                'object_text': metadata['object_texts'][idx],
-                'embedding_id': metadata['embedding_ids'][idx],
-                'search_method': 'semantic'
-            }
-            
-            # Add object details
-            result.update(self._get_object_details(
-                result['object_type'], 
-                result['object_id']
-            ))
-            
-            results.append(result)
+                
+            try:
+                result = {
+                    'id': metadata['embedding_ids'][idx],
+                    'object_type': metadata['object_types'][idx],
+                    'object_id': metadata['object_ids'][idx],
+                    'text': metadata['object_texts'][idx],
+                    'score': float(score),
+                    'rank': i + 1,
+                    'search_type': 'semantic'
+                }
+                results.append(result)
+            except IndexError:
+                logger.warning(f"Index out of bounds for FAISS result {idx}")
+                continue
         
         return results
     
-    def _search_text_index(self, query: str, index_data: Dict, 
-                          search_type: str, top_k: int) -> List[Dict[str, Any]]:
-        """Search TF-IDF or BM25 text index"""
-        vectorizer = index_data['vectorizer']
-        matrix = index_data['matrix']
-        metadata = index_data['metadata']
-        
+    def _search_tfidf_index(self, query: str, index_data: Dict, 
+                          top_k: int, min_score: float) -> List[Dict]:
+        """Search TF-IDF index"""
         # Transform query
-        query_vector = vectorizer.transform([query])
+        query_vector = index_data['vectorizer'].transform([query])
         
-        # Calculate similarities
-        similarities = cosine_similarity(query_vector, matrix).flatten()
+        # Calculate similarity
+        similarities = cosine_similarity(query_vector, index_data['matrix']).flatten()
         
         # Get top results
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+        top_indices = similarities.argsort()[-top_k:][::-1]
         
         results = []
+        metadata = index_data['metadata']
+        
         for i, idx in enumerate(top_indices):
             score = similarities[idx]
-            
-            if score <= 0:  # Skip zero similarities
+            if score < min_score:
                 continue
-            
-            result = {
-                'rank': i + 1,
-                'score': float(score),
-                'similarity': float(score),
-                'object_type': metadata['object_types'][idx],
-                'object_id': metadata['object_ids'][idx],
-                'object_text': metadata['object_texts'][idx],
-                'embedding_id': metadata['embedding_ids'][idx],
-                'search_method': 'lexical'
-            }
-            
-            # Add object details
-            result.update(self._get_object_details(
-                result['object_type'], 
-                result['object_id']
-            ))
-            
-            results.append(result)
+                
+            try:
+                result = {
+                    'id': metadata['embedding_ids'][idx],
+                    'object_type': metadata['object_types'][idx],
+                    'object_id': metadata['object_ids'][idx],
+                    'text': metadata['object_texts'][idx],
+                    'score': float(score),
+                    'rank': i + 1,
+                    'search_type': 'keyword'
+                }
+                results.append(result)
+            except IndexError:
+                logger.warning(f"Index out of bounds for TF-IDF result {idx}")
+                continue
         
         return results
     
-    def _get_object_details(self, object_type: str, object_id: int) -> Dict[str, Any]:
-        """Get additional details about the search result object"""
-        details = {}
-        
-        try:
-            if object_type == 'table':
-                table = Table.query.get(object_id)
-                if table:
-                    details.update({
-                        'table_name': table.name,
-                        'table_display_name': table.display_name,
-                        'table_description': table.description,
-                        'source_name': table.source.name if table.source else None,
-                        'row_count': table.row_count,
-                        'column_count': table.column_count
-                    })
-            
-            elif object_type == 'column':
-                column = Column.query.get(object_id)
-                if column:
-                    details.update({
-                        'column_name': column.name,
-                        'column_display_name': column.display_name,
-                        'column_description': column.description,
-                        'table_name': column.table.name if column.table else None,
-                        'data_type': column.data_type,
-                        'business_category': column.business_category,
-                        'is_primary_key': column.is_primary_key,
-                        'sample_values': column.sample_values[:3] if column.sample_values else []
-                    })
-            
-            elif object_type == 'dictionary_entry':
-                entry = DictionaryEntry.query.get(object_id)
-                if entry:
-                    details.update({
-                        'term': entry.term,
-                        'definition': entry.definition,
-                        'category': entry.category,
-                        'domain': entry.domain,
-                        'synonyms': entry.synonyms or [],
-                        'status': entry.status
-                    })
-        
-        except Exception as e:
-            logger.warning(f"Error getting object details: {str(e)}")
-        
-        return details
+    def _search_bm25_index(self, query: str, index_data: Dict, 
+                         top_k: int, min_score: float) -> List[Dict]:
+        """Search BM25 index (similar to TF-IDF but with different scoring)"""
+        return self._search_tfidf_index(query, index_data, top_k, min_score)
     
-    def _merge_and_rank_results(self, all_results: List[Dict], 
-                               query: str, top_k: int) -> List[Dict[str, Any]]:
+    def _merge_and_rank_results(self, all_results: List[Dict], top_k: int) -> List[Dict]:
         """Merge results from multiple indexes and re-rank"""
         if not all_results:
             return []
         
-        # Group by object
+        # Group by object to avoid duplicates
         object_groups = {}
         for result in all_results:
             key = f"{result['object_type']}_{result['object_id']}"
@@ -276,327 +238,162 @@ class SearchService:
                 object_groups[key] = []
             object_groups[key].append(result)
         
-        # Merge scores for each object
+        # Take best score for each object
         merged_results = []
-        for key, group in object_groups.items():
-            # Take the best result as base
-            best_result = max(group, key=lambda x: x['score'])
+        for object_key, results in object_groups.items():
+            best_result = max(results, key=lambda x: x['score'])
             
-            # Calculate combined score
-            scores = [r['score'] for r in group]
-            methods = list(set(r['search_method'] for r in group))
+            # Add information about multiple matches
+            if len(results) > 1:
+                best_result['match_count'] = len(results)
+                best_result['search_types'] = list(set(r['search_type'] for r in results))
             
-            # Weighted combination
-            if len(methods) > 1:
-                # Hybrid score: weighted average with bonus for multi-method match
-                combined_score = np.mean(scores) * 1.2  # 20% bonus for multi-method
-                search_method = 'hybrid'
-            else:
-                combined_score = max(scores)
-                search_method = methods[0]
-            
-            # Add fuzzy matching bonus
-            fuzzy_bonus = self._calculate_fuzzy_bonus(query, best_result)
-            combined_score = min(combined_score + fuzzy_bonus, 1.0)
-            
-            merged_result = best_result.copy()
-            merged_result.update({
-                'score': round(combined_score, 3),
-                'search_method': search_method,
-                'index_count': len(group),
-                'fuzzy_bonus': fuzzy_bonus
-            })
-            
-            merged_results.append(merged_result)
+            merged_results.append(best_result)
         
-        # Sort by combined score
+        # Sort by score and limit
         merged_results.sort(key=lambda x: x['score'], reverse=True)
-        
-        # Re-rank and limit
-        for i, result in enumerate(merged_results[:top_k]):
-            result['rank'] = i + 1
-        
         return merged_results[:top_k]
     
-    def _calculate_fuzzy_bonus(self, query: str, result: Dict[str, Any]) -> float:
-        """Calculate fuzzy matching bonus"""
-        query_lower = query.lower()
-        bonus = 0.0
-        
-        # Check against different text fields
-        text_fields = [
-            result.get('object_text', ''),
-            result.get('table_name', ''),
-            result.get('column_name', ''),
-            result.get('term', ''),
-            result.get('table_display_name', ''),
-            result.get('column_display_name', '')
-        ]
-        
-        max_fuzzy_score = 0
-        for text in text_fields:
-            if text:
-                fuzzy_score = fuzz.partial_ratio(query_lower, text.lower())
-                max_fuzzy_score = max(max_fuzzy_score, fuzzy_score)
-        
-        # Convert to bonus (0.0 to 0.3)
-        if max_fuzzy_score > 90:
-            bonus = 0.3
-        elif max_fuzzy_score > 80:
-            bonus = 0.2
-        elif max_fuzzy_score > 70:
-            bonus = 0.1
-        
-        return round(bonus, 3)
-    
-    def search_by_type(self, query: str, object_type: str, 
-                      project_id: int, top_k: int = 10) -> List[Dict[str, Any]]:
-        """Search for specific object type (tables, columns, dictionary)"""
-        try:
-            if object_type == 'tables':
-                return self._search_tables(query, project_id, top_k)
-            elif object_type == 'columns':
-                return self._search_columns(query, project_id, top_k)
-            elif object_type == 'dictionary':
-                return self._search_dictionary(query, project_id, top_k)
-            else:
-                raise ValueError(f"Unsupported object type: {object_type}")
-        
-        except Exception as e:
-            logger.error(f"Type-specific search error: {str(e)}")
-            raise
-    
-    def _search_tables(self, query: str, project_id: int, top_k: int) -> List[Dict[str, Any]]:
-        """Search tables using fuzzy matching"""
-        tables = db.session.query(Table).join(
-            Table.source
-        ).filter(
-            Table.source.has(project_id=project_id)
-        ).all()
-        
-        results = []
-        query_lower = query.lower()
-        
-        for table in tables:
-            # Calculate relevance score
-            scores = []
-            
-            # Name matching
-            name_score = fuzz.ratio(query_lower, table.name.lower()) / 100
-            scores.append(name_score * 1.0)  # Full weight for name
-            
-            # Display name matching
-            if table.display_name:
-                display_score = fuzz.ratio(query_lower, table.display_name.lower()) / 100
-                scores.append(display_score * 0.8)
-            
-            # Description matching
-            if table.description:
-                desc_score = fuzz.partial_ratio(query_lower, table.description.lower()) / 100
-                scores.append(desc_score * 0.6)
-            
-            # Combined score
-            combined_score = max(scores) if scores else 0
-            
-            if combined_score > 0.3:  # Threshold
-                result = {
-                    'object_type': 'table',
-                    'object_id': table.id,
-                    'score': round(combined_score, 3),
-                    'table_name': table.name,
-                    'table_display_name': table.display_name,
-                    'table_description': table.description,
-                    'source_name': table.source.name if table.source else None,
-                    'row_count': table.row_count,
-                    'column_count': table.column_count,
-                    'search_method': 'fuzzy'
-                }
-                results.append(result)
-        
-        # Sort and limit
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
-    
-    def _search_columns(self, query: str, project_id: int, top_k: int) -> List[Dict[str, Any]]:
-        """Search columns using fuzzy matching"""
-        columns = db.session.query(Column).join(
-            Column.table
-        ).join(
-            Table.source
-        ).filter(
-            Table.source.has(project_id=project_id)
-        ).all()
-        
-        results = []
-        query_lower = query.lower()
-        
-        for column in columns:
-            scores = []
-            
-            # Name matching
-            name_score = fuzz.ratio(query_lower, column.name.lower()) / 100
-            scores.append(name_score * 1.0)
-            
-            # Display name matching
-            if column.display_name:
-                display_score = fuzz.ratio(query_lower, column.display_name.lower()) / 100
-                scores.append(display_score * 0.8)
-            
-            # Description matching
-            if column.description:
-                desc_score = fuzz.partial_ratio(query_lower, column.description.lower()) / 100
-                scores.append(desc_score * 0.6)
-            
-            # Business category matching
-            if column.business_category:
-                cat_score = fuzz.ratio(query_lower, column.business_category.lower()) / 100
-                scores.append(cat_score * 0.4)
-            
-            combined_score = max(scores) if scores else 0
-            
-            if combined_score > 0.3:
-                result = {
-                    'object_type': 'column',
-                    'object_id': column.id,
-                    'score': round(combined_score, 3),
-                    'column_name': column.name,
-                    'column_display_name': column.display_name,
-                    'column_description': column.description,
-                    'table_name': column.table.name,
-                    'data_type': column.data_type,
-                    'business_category': column.business_category,
-                    'search_method': 'fuzzy'
-                }
-                results.append(result)
-        
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
-    
-    def _search_dictionary(self, query: str, project_id: int, top_k: int) -> List[Dict[str, Any]]:
-        """Search dictionary entries using fuzzy matching"""
-        entries = DictionaryEntry.query.filter_by(
-            project_id=project_id
-        ).filter(
-            DictionaryEntry.status != 'archived'
-        ).all()
-        
-        results = []
-        query_lower = query.lower()
-        
-        for entry in entries:
-            scores = []
-            
-            # Term matching
-            term_score = fuzz.ratio(query_lower, entry.term.lower()) / 100
-            scores.append(term_score * 1.0)
-            
-            # Definition matching
-            def_score = fuzz.partial_ratio(query_lower, entry.definition.lower()) / 100
-            scores.append(def_score * 0.7)
-            
-            # Synonym matching
-            if entry.synonyms:
-                syn_scores = [
-                    fuzz.ratio(query_lower, syn.lower()) / 100 
-                    for syn in entry.synonyms
-                ]
-                if syn_scores:
-                    scores.append(max(syn_scores) * 0.9)
-            
-            # Abbreviation matching
-            if entry.abbreviations:
-                abbrev_scores = [
-                    fuzz.ratio(query_lower, abbrev.lower()) / 100 
-                    for abbrev in entry.abbreviations
-                ]
-                if abbrev_scores:
-                    scores.append(max(abbrev_scores) * 0.8)
-            
-            combined_score = max(scores) if scores else 0
-            
-            if combined_score > 0.3:
-                result = {
-                    'object_type': 'dictionary_entry',
-                    'object_id': entry.id,
-                    'score': round(combined_score, 3),
-                    'term': entry.term,
-                    'definition': entry.definition,
-                    'category': entry.category,
-                    'domain': entry.domain,
-                    'synonyms': entry.synonyms or [],
-                    'search_method': 'fuzzy'
-                }
-                results.append(result)
-        
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
-    
-    def _log_search(self, query: str, index_id: Optional[int], search_type: str, 
-                   results: List[Dict], search_time_ms: float, project_id: int):
-        """Log search for analytics"""
+    def _log_search(self, query: str, project_id: int, result_count: int, search_time: float):
+        """Log search query for analytics"""
         try:
             search_log = SearchLog(
                 project_id=project_id,
-                query_text=query,
-                query_type=search_type,
-                index_id=index_id,
-                results_count=len(results),
-                top_score=results[0]['score'] if results else 0.0,
-                response_time_ms=search_time_ms,
-                user_id='anonymous',  # TODO: Get from session
-                session_id='session_123'  # TODO: Get from session
+                query=query,
+                result_count=result_count,
+                search_time_seconds=round(search_time, 3),
+                timestamp=datetime.utcnow()
             )
-            
             db.session.add(search_log)
             db.session.commit()
-            
         except Exception as e:
             logger.warning(f"Failed to log search: {str(e)}")
             db.session.rollback()
     
-    def get_search_suggestions(self, partial_query: str, project_id: int, 
-                             limit: int = 5) -> List[str]:
-        """Get search suggestions based on partial query"""
+    def get_search_suggestions(self, query: str, project_id: int, limit: int = 5) -> List[str]:
+        """Get search suggestions based on dictionary and previous searches"""
+        suggestions = []
+        
         try:
-            suggestions = set()
+            # Get dictionary terms that match
+            dictionary_matches = DictionaryEntry.query.filter(
+                DictionaryEntry.project_id == project_id,
+                DictionaryEntry.term.ilike(f'%{query}%')
+            ).limit(limit).all()
             
-            # Get suggestions from table names
-            tables = db.session.query(Table.name).join(
-                Table.source
-            ).filter(
-                Table.source.has(project_id=project_id)
-            ).all()
+            suggestions.extend([entry.term for entry in dictionary_matches])
             
-            for (name,) in tables:
-                if partial_query.lower() in name.lower():
-                    suggestions.add(name)
+            # Get popular searches
+            if len(suggestions) < limit:
+                popular_searches = db.session.query(SearchLog.query)\
+                    .filter(SearchLog.project_id == project_id)\
+                    .filter(SearchLog.query.ilike(f'%{query}%'))\
+                    .group_by(SearchLog.query)\
+                    .order_by(db.func.count(SearchLog.query).desc())\
+                    .limit(limit - len(suggestions))\
+                    .all()
+                
+                suggestions.extend([log.query for log in popular_searches])
             
-            # Get suggestions from column names
-            columns = db.session.query(Column.name).join(
-                Column.table
-            ).join(
-                Table.source
-            ).filter(
-                Table.source.has(project_id=project_id)
-            ).all()
-            
-            for (name,) in columns:
-                if partial_query.lower() in name.lower():
-                    suggestions.add(name)
-            
-            # Get suggestions from dictionary terms
-            terms = db.session.query(DictionaryEntry.term).filter_by(
-                project_id=project_id
-            ).filter(
-                DictionaryEntry.status != 'archived'
-            ).all()
-            
-            for (term,) in terms:
-                if partial_query.lower() in term.lower():
-                    suggestions.add(term)
-            
-            return list(suggestions)[:limit]
+            return suggestions[:limit]
             
         except Exception as e:
             logger.error(f"Error getting search suggestions: {str(e)}")
+            return suggestions
+    
+    def get_search_analytics(self, project_id: int, days: int = 30) -> Dict[str, Any]:
+        """Get search analytics for a project"""
+        try:
+            from sqlalchemy import func
+            from datetime import datetime, timedelta
+            
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            
+            # Basic stats
+            total_searches = SearchLog.query.filter(
+                SearchLog.project_id == project_id,
+                SearchLog.timestamp >= cutoff_date
+            ).count()
+            
+            # Average results and search time
+            avg_stats = db.session.query(
+                func.avg(SearchLog.result_count).label('avg_results'),
+                func.avg(SearchLog.search_time_seconds).label('avg_time')
+            ).filter(
+                SearchLog.project_id == project_id,
+                SearchLog.timestamp >= cutoff_date
+            ).first()
+            
+            # Top queries
+            top_queries = db.session.query(
+                SearchLog.query,
+                func.count(SearchLog.query).label('count')
+            ).filter(
+                SearchLog.project_id == project_id,
+                SearchLog.timestamp >= cutoff_date
+            ).group_by(SearchLog.query)\
+            .order_by(func.count(SearchLog.query).desc())\
+            .limit(10).all()
+            
+            # Search volume by day
+            daily_volume = db.session.query(
+                func.date(SearchLog.timestamp).label('date'),
+                func.count(SearchLog.id).label('count')
+            ).filter(
+                SearchLog.project_id == project_id,
+                SearchLog.timestamp >= cutoff_date
+            ).group_by(func.date(SearchLog.timestamp))\
+            .order_by(func.date(SearchLog.timestamp)).all()
+            
+            return {
+                'total_searches': total_searches,
+                'avg_results': round(float(avg_stats.avg_results or 0), 2),
+                'avg_search_time': round(float(avg_stats.avg_time or 0), 3),
+                'top_queries': [{'query': q.query, 'count': q.count} for q in top_queries],
+                'daily_volume': [{'date': str(d.date), 'count': d.count} for d in daily_volume],
+                'period_days': days
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting search analytics: {str(e)}")
+            return {
+                'total_searches': 0,
+                'avg_results': 0,
+                'avg_search_time': 0,
+                'top_queries': [],
+                'daily_volume': [],
+                'period_days': days
+            }
+    
+    def clear_index_cache(self, index_id: Optional[int] = None):
+        """Clear cached indexes"""
+        if index_id:
+            self.loaded_indexes.pop(index_id, None)
+        else:
+            self.loaded_indexes.clear()
+        logger.info(f"Cleared index cache for index {index_id if index_id else 'all'}")
+    
+    def get_available_indexes(self, project_id: int) -> List[Dict[str, Any]]:
+        """Get list of available indexes for a project"""
+        try:
+            indexes = Index.query.filter_by(project_id=project_id).all()
+            
+            result = []
+            for index in indexes:
+                index_info = {
+                    'id': index.id,
+                    'name': index.name,
+                    'index_type': index.index_type,
+                    'status': index.status,
+                    'total_vectors': index.total_vectors,
+                    'embedding_model': index.embedding_model,
+                    'created_at': index.created_at.isoformat() if index.created_at else None,
+                    'build_progress': index.build_progress
+                }
+                result.append(index_info)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting available indexes: {str(e)}")
             return []
