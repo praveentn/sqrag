@@ -1,71 +1,90 @@
-# requirements.txt
-# Core Flask and web framework
-# Flask>=2.3.2
-# Flask-SQLAlchemy>=3.0.5
-# Flask-CORS>=4.0.0
-# Werkzeug>=2.3.6
+# Core Web Framework
+Flask>=2.3.3
+Flask-CORS>=4.0.0
+Flask-SQLAlchemy>=3.0.5
+Werkzeug>=2.3.7
 
-# Database drivers
-psycopg2-binary>=2.9.7
-PyMySQL>=1.1.0
-SQLAlchemy>=2.0.19
+# Database and ORM
+SQLAlchemy>=2.0.21
+alembic>=1.12.0
 
-# Data processing
-# pandas>=2.0.3
-# numpy>=1.24.3
-# openpyxl>=3.1.2
-# xlrd>=2.0.1
+# Data Processing
+pandas>=2.1.1
+numpy>=1.24.3
+openpyxl>=3.1.2
+xlrd>=2.0.1
 
-# Machine learning and embeddings
-# sentence-transformers>=2.2.2
-# scikit-learn>=1.3.0
-# faiss-cpu>=1.7.4
+# NLP and ML Libraries
+sentence-transformers>=2.2.2
+transformers>=4.33.2
+torch>=2.0.1
+scikit-learn>=1.3.0
+nltk>=3.8.1
 
-# NLP and text processing
+# Vector Search
+faiss-cpu>=1.7.4
+# For GPU support, use: faiss-gpu>=1.7.4
+
+# Fuzzy String Matching
 fuzzywuzzy>=0.18.0
 python-Levenshtein>=0.21.1
 
-# Azure OpenAI and AI services
-openai>=1.3.3
-azure-cognitiveservices-language-textanalytics>=5.2.0
-azure-ai-textanalytics>=5.3.0
+# OpenAI and Azure OpenAI
+openai>=0.28.1
+azure-openai>=0.1.0
 
-# Configuration and environment
-python-dotenv>=1.0.0
-dynaconf>=3.2.0
-pydantic>=2.1.1
-pydantic-settings>=2.0.2
+# Anthropic Claude
+anthropic>=0.3.11
 
-# Async and concurrency
-asyncio>=3.4.3
-aiofiles>=23.1.0
-asyncpg>=0.28.0
-
-# Monitoring and logging
-psutil>=5.9.5
-
-# Security and validation
-sqlparse>=0.4.4
-sqlglot>=17.10.0
-
-# Testing (optional)
-pytest>=7.4.0
-pytest-flask>=1.2.0
-pytest-cov>=4.1.0
-
-# Type checking
-mypy>=1.4.1
-types-requests>=2.31.0.2
-
-# Development tools
-black>=23.7.0
-isort>=5.12.0
-flake8>=6.0.0
-pre-commit>=3.3.3
-
-# Additional utilities
+# HTTP Requests and Utilities
 requests>=2.31.0
 urllib3>=2.0.4
-Pillow>=10.0.0
+certifi>=2023.7.22
+
+# Environment and Configuration
+python-dotenv>=1.0.0
+pyyaml>=6.0.1
+
+# Date and Time Utilities
 python-dateutil>=2.8.2
-pytz>=2023.3
+
+# File Processing
+chardet>=5.2.0
+magic>=0.4.27
+
+# Logging and Monitoring
+colorama>=0.4.6
+
+# Security
+cryptography>=41.0.4
+
+# Development and Testing (Optional)
+pytest>=7.4.2
+pytest-cov>=4.1.0
+black>=23.7.0
+flake8>=6.0.0
+
+# Production Server (Optional)
+gunicorn>=21.2.0
+
+# Database Drivers (Optional - uncomment as needed)
+# psycopg2-binary>=2.9.7  # PostgreSQL
+# PyMySQL>=1.1.0          # MySQL
+# pymongo>=4.5.0          # MongoDB
+
+# Vector Database Extensions (Optional)
+# pgvector>=0.1.8         # PostgreSQL vector extension
+
+# Additional ML Libraries (Optional)
+# spacy>=3.6.1
+# huggingface-hub>=0.16.4
+
+# Web Scraping (Optional)
+# beautifulsoup4>=4.12.2
+# selenium>=4.11.2
+
+# Image Processing (Optional)
+# Pillow>=10.0.0
+
+# API Documentation (Optional)
+# flask-restx>=1.1.0

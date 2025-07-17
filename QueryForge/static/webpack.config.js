@@ -2,6 +2,7 @@
 const path = require('path');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const webpack = require('webpack');
 
 module.exports = (env, argv) => {
   const isProduction = argv.mode === 'production';
@@ -80,6 +81,21 @@ module.exports = (env, argv) => {
       ]
     },
     plugins: [
+      // Define plugin to provide environment variables to the browser
+      new webpack.DefinePlugin({
+        'process.env': {
+          NODE_ENV: JSON.stringify(process.env.NODE_ENV || 'development'),
+          REACT_APP_API_URL: JSON.stringify(process.env.REACT_APP_API_URL || 'http://localhost:5000/api'),
+          REACT_APP_VERSION: JSON.stringify(process.env.REACT_APP_VERSION || '1.0.0'),
+          REACT_APP_ENVIRONMENT: JSON.stringify(process.env.NODE_ENV || 'development')
+        }
+      }),
+      
+      // Provide plugin to make process available globally
+      new webpack.ProvidePlugin({
+        process: 'process/browser',
+      }),
+      
       new HtmlWebpackPlugin({
         template: './public/index.html',
         filename: 'index.html',
@@ -112,6 +128,9 @@ module.exports = (env, argv) => {
         '@components': path.resolve(__dirname, 'src/components'),
         '@utils': path.resolve(__dirname, 'src/utils'),
         '@styles': path.resolve(__dirname, 'src/styles')
+      },
+      fallback: {
+        "process": require.resolve("process/browser")
       }
     },
     optimization: {

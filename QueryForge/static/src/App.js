@@ -27,7 +27,30 @@ import {
   ChevronDown
 } from 'lucide-react';
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000/api';
+// Environment configuration with fallbacks
+const getApiBaseUrl = () => {
+  // Try multiple sources for environment variables
+  if (typeof process !== 'undefined' && process.env && process.env.REACT_APP_API_URL) {
+    return process.env.REACT_APP_API_URL;
+  }
+  
+  // Fallback to window environment variables (set by HTML template)
+  if (typeof window !== 'undefined' && window.ENV && window.ENV.API_URL) {
+    return window.ENV.API_URL;
+  }
+  
+  // Final fallback based on current location
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname, port } = window.location;
+    const backendPort = '5000';
+    return `${protocol}//${hostname}:${backendPort}/api`;
+  }
+  
+  // Default fallback
+  return 'http://localhost:5000/api';
+};
+
+const API_BASE_URL = getApiBaseUrl();
 
 const App = () => {
   const [activeTab, setActiveTab] = useState(0);
@@ -60,250 +83,157 @@ const App = () => {
       name: 'Data Dictionary', 
       icon: BookOpen, 
       component: DictionaryTab,
-      description: 'Define business terms and metadata',
+      description: 'Manage table and column mappings',
       requiresProject: true
     },
     { 
       id: 3, 
-      name: 'Embeddings & Indexing', 
+      name: 'Embeddings', 
       icon: Cpu, 
       component: EmbeddingsTab,
-      description: 'Create embeddings and search indexes',
+      description: 'Generate and manage vector embeddings',
       requiresProject: true
     },
     { 
       id: 4, 
-      name: 'Search Playground', 
+      name: 'Search', 
       icon: Search, 
       component: SearchTab,
-      description: 'Test different search methods',
+      description: 'Perform intelligent data searches',
       requiresProject: true
     },
     { 
       id: 5, 
-      name: 'Chat (NL → SQL)', 
+      name: 'Chat', 
       icon: MessageSquare, 
       component: ChatTab,
-      description: 'Natural language to SQL conversion',
+      description: 'Natural language chat interface',
       requiresProject: true
     },
     { 
       id: 6, 
-      name: 'Admin Panel', 
+      name: 'Admin', 
       icon: Settings, 
       component: AdminTab,
       description: 'System administration and monitoring'
     }
   ];
 
+  // Load projects on component mount
   useEffect(() => {
-    fetchProjects();
+    loadProjects();
   }, []);
 
-  const fetchProjects = async () => {
+  const loadProjects = async () => {
     try {
       setLoading(true);
       const response = await fetch(`${API_BASE_URL}/projects`);
-      if (!response.ok) throw new Error('Failed to fetch projects');
+      
+      if (!response.ok) {
+        throw new Error(`Failed to load projects: ${response.status} ${response.statusText}`);
+      }
       
       const data = await response.json();
-      setProjects(data.projects || []);
       
-      // Auto-select first project if available
-      if (data.projects && data.projects.length > 0 && !selectedProject) {
-        setSelectedProject(data.projects[0]);
+      if (data.success) {
+        setProjects(data.projects || []);
+        
+        // Auto-select first project if available
+        if (data.projects && data.projects.length > 0 && !selectedProject) {
+          setSelectedProject(data.projects[0]);
+        }
+      } else {
+        throw new Error(data.error || 'Failed to load projects');
       }
     } catch (err) {
+      console.error('Error loading projects:', err);
       setError(err.message);
-      showNotification('Error fetching projects: ' + err.message, 'error');
+      showNotification('Failed to load projects. Please check your connection.', 'error');
     } finally {
       setLoading(false);
     }
   };
 
-  const showNotification = (message, type = 'info') => {
-    setNotification({ message, type, id: Date.now() });
-    setTimeout(() => setNotification(null), 5000);
+  const showNotification = (message, type = 'info', duration = 5000) => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), duration);
   };
 
   const handleTabChange = (tabId) => {
     const tab = tabs.find(t => t.id === tabId);
+    
+    // Check if tab requires a project
     if (tab && tab.requiresProject && !selectedProject) {
       showNotification('Please select a project first', 'warning');
       return;
     }
+    
     setActiveTab(tabId);
   };
 
-  const handleProjectChange = (project) => {
+  const handleProjectSelect = (project) => {
     setSelectedProject(project);
     showNotification(`Switched to project: ${project.name}`, 'success');
   };
 
-  const renderTabContent = () => {
+  const handleProjectCreate = (project) => {
+    setProjects(prev => [...prev, project]);
+    setSelectedProject(project);
+    showNotification(`Created project: ${project.name}`, 'success');
+  };
+
+  const handleProjectUpdate = (updatedProject) => {
+    setProjects(prev => prev.map(p => p.id === updatedProject.id ? updatedProject : p));
+    if (selectedProject && selectedProject.id === updatedProject.id) {
+      setSelectedProject(updatedProject);
+    }
+    showNotification(`Updated project: ${updatedProject.name}`, 'success');
+  };
+
+  const handleProjectDelete = (projectId) => {
+    setProjects(prev => prev.filter(p => p.id !== projectId));
+    if (selectedProject && selectedProject.id === projectId) {
+      setSelectedProject(null);
+      setActiveTab(0); // Switch back to Projects tab
+    }
+    showNotification('Project deleted successfully', 'success');
+  };
+
+  // Get current tab component
+  const getCurrentTabComponent = () => {
     const currentTab = tabs.find(tab => tab.id === activeTab);
     if (!currentTab) return null;
 
     const Component = currentTab.component;
-    return (
-      <Component
-        projectId={selectedProject?.id}
-        project={selectedProject}
-        apiUrl={API_BASE_URL}
-        onNotification={showNotification}
-        onProjectsChange={fetchProjects}
-        onProjectSelect={handleProjectChange}
-      />
-    );
+    
+    const commonProps = {
+      selectedProject,
+      projects,
+      onProjectSelect: handleProjectSelect,
+      onProjectCreate: handleProjectCreate,
+      onProjectUpdate: handleProjectUpdate,
+      onProjectDelete: handleProjectDelete,
+      showNotification,
+      apiBaseUrl: API_BASE_URL
+    };
+
+    return <Component {...commonProps} />;
   };
 
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <LoadingSpinner size="large" message="Loading QueryForge Pro..." />
+        <div className="text-center">
+          <LoadingSpinner size="large" />
+          <p className="mt-4 text-lg text-gray-600">Loading QueryForge Pro...</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      {/* Header */}
-      <header className="bg-white shadow-sm border-b border-gray-200">
-        <div className="px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            {/* Logo and Title */}
-            <div className="flex items-center">
-              <button
-                onClick={() => setSidebarOpen(!sidebarOpen)}
-                className="p-2 rounded-md text-gray-400 hover:text-gray-500 hover:bg-gray-100 lg:hidden"
-              >
-                {sidebarOpen ? <X className="h-6 w-6" /> : <Menu className="h-6 w-6" />}
-              </button>
-              <div className="flex items-center ml-4">
-                <div className="flex-shrink-0">
-                  <div className="h-8 w-8 bg-gradient-to-r from-blue-500 to-purple-600 rounded-md flex items-center justify-center">
-                    <Database className="h-5 w-5 text-white" />
-                  </div>
-                </div>
-                <div className="ml-3">
-                  <h1 className="text-xl font-semibold text-gray-900">QueryForge Pro</h1>
-                  <p className="text-sm text-gray-500">Intelligent Data Querying Platform</p>
-                </div>
-              </div>
-            </div>
-
-            {/* Project Selector */}
-            <div className="flex items-center space-x-4">
-              <div className="relative">
-                <select
-                  value={selectedProject?.id || ''}
-                  onChange={(e) => {
-                    const project = projects.find(p => p.id === parseInt(e.target.value));
-                    if (project) handleProjectChange(project);
-                  }}
-                  className="block w-64 pl-3 pr-10 py-2 text-base border-gray-300 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm rounded-md bg-white"
-                  disabled={projects.length === 0}
-                >
-                  <option value="">Select a project...</option>
-                  {projects.map((project) => (
-                    <option key={project.id} value={project.id}>
-                      {project.name}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown className="absolute right-3 top-3 h-4 w-4 text-gray-400 pointer-events-none" />
-              </div>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      <div className="flex">
-        {/* Sidebar */}
-        <aside className={`${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0 fixed lg:static inset-y-0 left-0 z-50 w-64 bg-white shadow-lg transform transition-transform duration-200 ease-in-out lg:transform-none`}>
-          <div className="flex flex-col h-full">
-            {/* Navigation */}
-            <nav className="flex-1 pt-6 pb-4 overflow-y-auto">
-              <div className="px-3">
-                {tabs.map((tab) => {
-                  const Icon = tab.icon;
-                  const isActive = activeTab === tab.id;
-                  const isDisabled = tab.requiresProject && !selectedProject;
-                  
-                  return (
-                    <button
-                      key={tab.id}
-                      onClick={() => handleTabChange(tab.id)}
-                      disabled={isDisabled}
-                      className={`
-                        group flex items-center px-3 py-2 text-sm font-medium rounded-md w-full text-left mb-1
-                        ${isActive 
-                          ? 'bg-blue-50 text-blue-700 border-r-2 border-blue-700' 
-                          : isDisabled
-                            ? 'text-gray-400 cursor-not-allowed'
-                            : 'text-gray-600 hover:bg-gray-50 hover:text-gray-900'
-                        }
-                      `}
-                    >
-                      <Icon className={`mr-3 h-5 w-5 ${isActive ? 'text-blue-500' : isDisabled ? 'text-gray-300' : 'text-gray-400'}`} />
-                      <div className="flex-1">
-                        <div className="text-sm font-medium">{tab.name}</div>
-                        <div className={`text-xs ${isActive ? 'text-blue-600' : 'text-gray-500'}`}>
-                          {tab.description}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            </nav>
-
-            {/* Footer */}
-            <div className="flex-shrink-0 border-t border-gray-200 p-4">
-              <div className="text-xs text-gray-500 text-center">
-                <div>QueryForge Pro v1.0</div>
-                <div>Enterprise RAG Platform</div>
-              </div>
-            </div>
-          </div>
-        </aside>
-
-        {/* Main Content */}
-        <main className="flex-1 lg:ml-0">
-          <div className="py-6">
-            <div className="px-4 sm:px-6 lg:px-8">
-              {/* Page Header */}
-              <div className="mb-8">
-                <div className="md:flex md:items-center md:justify-between">
-                  <div className="flex-1 min-w-0">
-                    <h2 className="text-2xl font-bold leading-7 text-gray-900 sm:text-3xl sm:truncate">
-                      {tabs.find(tab => tab.id === activeTab)?.name}
-                    </h2>
-                    <div className="mt-1 flex flex-col sm:flex-row sm:flex-wrap sm:mt-0 sm:space-x-6">
-                      <div className="mt-2 flex items-center text-sm text-gray-500">
-                        {tabs.find(tab => tab.id === activeTab)?.description}
-                      </div>
-                      {selectedProject && (
-                        <div className="mt-2 flex items-center text-sm text-gray-500">
-                          <span className="font-medium">Project:</span>
-                          <span className="ml-1 text-gray-900">{selectedProject.name}</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Tab Content */}
-              <div className="bg-white shadow rounded-lg min-h-[600px]">
-                {renderTabContent()}
-              </div>
-            </div>
-          </div>
-        </main>
-      </div>
-
-      {/* Notifications */}
+    <div className="min-h-screen bg-gray-50 flex">
+      {/* Notification Banner */}
       {notification && (
         <NotificationBanner
           message={notification.message}
@@ -312,15 +242,148 @@ const App = () => {
         />
       )}
 
-      {/* Mobile sidebar overlay */}
-      {sidebarOpen && (
-        <div 
-          className="fixed inset-0 z-40 lg:hidden"
-          onClick={() => setSidebarOpen(false)}
-        >
-          <div className="absolute inset-0 bg-gray-600 opacity-75"></div>
+      {/* Sidebar */}
+      <div className={`bg-white shadow-lg transition-all duration-300 ${sidebarOpen ? 'w-64' : 'w-16'}`}>
+        {/* Header */}
+        <div className="p-4 border-b border-gray-200">
+          <div className="flex items-center justify-between">
+            {sidebarOpen && (
+              <h1 className="text-xl font-bold text-gray-900">QueryForge Pro</h1>
+            )}
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="p-1 rounded-md hover:bg-gray-100 transition-colors"
+            >
+              {sidebarOpen ? <X size={20} /> : <Menu size={20} />}
+            </button>
+          </div>
         </div>
-      )}
+
+        {/* Project Selector */}
+        {sidebarOpen && (
+          <div className="p-4 border-b border-gray-200">
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Current Project
+            </label>
+            {projects.length > 0 ? (
+              <div className="relative">
+                <select
+                  value={selectedProject?.id || ''}
+                  onChange={(e) => {
+                    const project = projects.find(p => p.id === parseInt(e.target.value));
+                    if (project) handleProjectSelect(project);
+                  }}
+                  className="w-full p-2 border border-gray-300 rounded-md bg-white focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  <option value="">Select a project...</option>
+                  {projects.map(project => (
+                    <option key={project.id} value={project.id}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">No projects available</p>
+            )}
+          </div>
+        )}
+
+        {/* Navigation */}
+        <nav className="p-4">
+          <ul className="space-y-2">
+            {tabs.map((tab) => {
+              const Icon = tab.icon;
+              const isActive = activeTab === tab.id;
+              const isDisabled = tab.requiresProject && !selectedProject;
+              
+              return (
+                <li key={tab.id}>
+                  <button
+                    onClick={() => handleTabChange(tab.id)}
+                    disabled={isDisabled}
+                    className={`w-full flex items-center px-3 py-2 rounded-md text-left transition-colors ${
+                      isActive
+                        ? 'bg-blue-100 text-blue-700 border border-blue-200'
+                        : isDisabled
+                        ? 'text-gray-400 cursor-not-allowed'
+                        : 'text-gray-700 hover:bg-gray-100'
+                    }`}
+                    title={sidebarOpen ? tab.description : tab.name}
+                  >
+                    <Icon size={20} className="flex-shrink-0" />
+                    {sidebarOpen && (
+                      <span className="ml-3 font-medium">{tab.name}</span>
+                    )}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </nav>
+
+        {/* Footer */}
+        {sidebarOpen && (
+          <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-gray-200 bg-white">
+            <div className="text-xs text-gray-500">
+              <p>QueryForge Pro v1.0.0</p>
+              <p>Enterprise RAG Platform</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col">
+        {/* Top Bar */}
+        <div className="bg-white shadow-sm border-b border-gray-200 p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-2xl font-bold text-gray-900">
+                {tabs.find(tab => tab.id === activeTab)?.name}
+              </h2>
+              <p className="text-sm text-gray-600 mt-1">
+                {tabs.find(tab => tab.id === activeTab)?.description}
+              </p>
+            </div>
+            
+            {selectedProject && (
+              <div className="text-right">
+                <p className="text-sm text-gray-600">Active Project</p>
+                <p className="font-medium text-gray-900">{selectedProject.name}</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Content Area */}
+        <div className="flex-1 p-6 overflow-y-auto">
+          {error ? (
+            <div className="bg-red-50 border border-red-200 rounded-md p-4">
+              <div className="flex">
+                <div className="flex-shrink-0">
+                  <X className="h-5 w-5 text-red-400" />
+                </div>
+                <div className="ml-3">
+                  <h3 className="text-sm font-medium text-red-800">Error</h3>
+                  <p className="mt-1 text-sm text-red-700">{error}</p>
+                  <button
+                    onClick={() => {
+                      setError(null);
+                      loadProjects();
+                    }}
+                    className="mt-2 text-sm text-red-600 hover:text-red-500 underline"
+                  >
+                    Try again
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            getCurrentTabComponent()
+          )}
+        </div>
+      </div>
     </div>
   );
 };

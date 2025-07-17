@@ -13,18 +13,48 @@ import time
 import logging
 from pathlib import Path
 
+# Force UTF-8 encoding for Windows compatibility
+if sys.platform.startswith('win'):
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+    # Set environment variables for UTF-8 encoding
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+
 # Add the current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def setup_logging():
-    """Configure logging for the startup script"""
+    """Configure logging for the startup script with Windows UTF-8 support"""
+    
+    # Create logs directory if it doesn't exist
+    os.makedirs('logs', exist_ok=True)
+    
+    # Configure logging with UTF-8 encoding for Windows
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    
+    # Create handlers with UTF-8 encoding
+    handlers = []
+    
+    # Console handler with UTF-8 encoding
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(log_format))
+    handlers.append(console_handler)
+    
+    # File handler with UTF-8 encoding
+    try:
+        file_handler = logging.FileHandler('logs/startup.log', mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format))
+        handlers.append(file_handler)
+    except Exception as e:
+        print(f"Warning: Could not create file log handler: {e}")
+    
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('logs/startup.log', mode='a')
-        ]
+        format=log_format,
+        handlers=handlers
     )
     return logging.getLogger(__name__)
 
@@ -61,6 +91,79 @@ def check_requirements():
         return False
     
     return True
+
+def create_sample_data():
+    """Create sample data for testing"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        from app import create_app
+        from models import db, Project
+        
+        logger.info("Creating sample data...")
+        app = create_app()
+        
+        with app.app_context():
+            # Create sample project if none exists
+            if Project.query.count() == 0:
+                sample_project = Project(
+                    name="Sample Project",
+                    description="A sample project for testing QueryForge Pro",
+                    created_by="system"
+                )
+                db.session.add(sample_project)
+                db.session.commit()
+                logger.info("✓ Sample project created")
+            else:
+                logger.info("✓ Sample data already exists")
+                
+        return True
+        
+    except Exception as e:
+        logger.error(f"Sample data creation failed: {e}")
+        return False
+
+def health_check():
+    """Perform application health check"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        import requests
+        import time
+        
+        logger.info("Performing health check...")
+        
+        # Start the app in a separate process for testing
+        # This is a basic implementation - in production you'd use proper testing
+        
+        # Check if port 5000 is available
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('localhost', 5000))
+        sock.close()
+        
+        if result == 0:
+            logger.info("✓ Application is running on port 5000")
+            
+            # Try to make a health check request
+            try:
+                response = requests.get('http://localhost:5000/api/health', timeout=5)
+                if response.status_code == 200:
+                    logger.info("✓ Health endpoint responding correctly")
+                    return True
+                else:
+                    logger.error(f"Health endpoint returned status {response.status_code}")
+                    return False
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Could not reach health endpoint: {e}")
+                return False
+        else:
+            logger.error("Application is not running on port 5000")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return False
 
 def init_database():
     """Initialize the database with tables"""
@@ -135,6 +238,9 @@ def start_development():
     # Set environment variables
     os.environ['FLASK_ENV'] = 'development'
     os.environ['FLASK_DEBUG'] = 'True'
+    # Set UTF-8 encoding for Windows
+    if sys.platform.startswith('win'):
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
     
     try:
         from app import create_app
@@ -170,6 +276,8 @@ def start_production():
     # Set environment variables
     os.environ['FLASK_ENV'] = 'production'
     os.environ['FLASK_DEBUG'] = 'False'
+    if sys.platform.startswith('win'):
+        os.environ['PYTHONIOENCODING'] = 'utf-8'
     
     try:
         # Check if gunicorn is available
@@ -235,112 +343,6 @@ def run_tests():
             
     except ImportError:
         logger.error("pytest not found. Install with: pip install pytest pytest-cov")
-        return False
-    except Exception as e:
-        logger.error(f"Test execution failed: {e}")
-        return False
-
-def health_check():
-    """Perform a health check on the application"""
-    logger = logging.getLogger(__name__)
-    
-    logger.info("Performing health check...")
-    
-    try:
-        import requests
-        import time
-        
-        # Start the app in background for testing
-        # This is a simplified health check
-        from app import create_app
-        from models import db
-        
-        app = create_app()
-        
-        with app.app_context():
-            # Test database connection
-            db.session.execute('SELECT 1')
-            logger.info("✓ Database connection: OK")
-            
-            # Test configuration
-            from config import Config
-            Config.validate_config()
-            logger.info("✓ Configuration: OK")
-            
-            # Test file system
-            test_dirs = ['uploads', 'indexes', 'logs']
-            for dir_name in test_dirs:
-                if os.path.exists(dir_name) and os.access(dir_name, os.W_OK):
-                    logger.info(f"✓ Directory {dir_name}: OK")
-                else:
-                    logger.warning(f"Directory {dir_name}: Not accessible")
-            
-            logger.info("✓ Health check completed successfully")
-            return True
-            
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return False
-
-def create_sample_data():
-    """Create sample data for testing"""
-    logger = logging.getLogger(__name__)
-    
-    logger.info("Creating sample data...")
-    
-    try:
-        from app import create_app
-        from models import db, Project, DictionaryEntry
-        
-        app = create_app()
-        
-        with app.app_context():
-            # Create sample project
-            sample_project = Project(
-                name="Sample E-commerce Project",
-                description="Demo project with sample e-commerce data",
-                owner="demo_user"
-            )
-            db.session.add(sample_project)
-            db.session.flush()
-            
-            # Create sample dictionary entries
-            sample_terms = [
-                {
-                    "term": "Customer",
-                    "definition": "An individual or organization that purchases products or services",
-                    "category": "business_term",
-                    "domain": "sales"
-                },
-                {
-                    "term": "Revenue",
-                    "definition": "Total income generated from sales of goods or services",
-                    "category": "business_term", 
-                    "domain": "finance"
-                },
-                {
-                    "term": "Order",
-                    "definition": "A request to purchase products or services",
-                    "category": "business_term",
-                    "domain": "sales"
-                }
-            ]
-            
-            for term_data in sample_terms:
-                entry = DictionaryEntry(
-                    project_id=sample_project.id,
-                    **term_data
-                )
-                db.session.add(entry)
-            
-            db.session.commit()
-            logger.info(f"✓ Sample project created: {sample_project.name}")
-            logger.info(f"✓ Created {len(sample_terms)} sample dictionary entries")
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to create sample data: {e}")
         return False
 
 def main():
