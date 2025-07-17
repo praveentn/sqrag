@@ -342,23 +342,20 @@ class EmbeddingService:
             self.models[model_name] = SentenceTransformer(model_name)
         
         return self.models[model_name]
-    
-    def _update_job_status(self, job_id: str, status: str, progress: float, message: str) -> None:
-        """Update job status"""
-        if job_id in self.job_status:
-            self.job_status[job_id].update({
-                'status': status,
-                'progress': round(progress, 2),
-                'message': message,
-                'updated_at': datetime.utcnow().isoformat()
-            })
-    
-    def get_job_status(self, job_id: str) -> Dict[str, Any]:
-        """Get status of embedding job"""
-        if job_id not in self.job_status:
-            return {'status': 'not_found', 'message': 'Job not found'}
         
-        return self.job_status[job_id]
+    def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get status of an embedding job"""
+        return self.job_status.get(job_id)
+
+    def _update_job_status(self, job_id: str, status: str, progress: float, message: str = None):
+        """Update job status"""
+        self.job_status[job_id] = {
+            'job_id': job_id,
+            'status': status,
+            'progress': progress,
+            'message': message,
+            'updated_at': datetime.utcnow().isoformat()
+        }
     
     def search_similar(self, query: str, index_name: str, top_k: int = 10, 
                       threshold: float = 0.5) -> List[Dict[str, Any]]:
@@ -573,3 +570,26 @@ class EmbeddingService:
             db.session.rollback()
             logger.error(f"Error cleaning up jobs: {str(e)}")
 
+def get_all_tables_for_admin():
+    """Get all tables from all data sources for admin panel"""
+    try:
+        from models import DataSource, Table
+        
+        all_tables = []
+        sources = DataSource.query.all()
+        
+        for source in sources:
+            for table in source.tables:
+                all_tables.append({
+                    'name': table.name,
+                    'display_name': table.display_name or table.name,
+                    'source_name': source.name,
+                    'source_id': source.id,
+                    'row_count': table.row_count or 0,
+                    'column_count': len(table.columns) if table.columns else 0
+                })
+        
+        return all_tables
+    except Exception as e:
+        logger.error(f"Error getting all tables: {str(e)}")
+        return []

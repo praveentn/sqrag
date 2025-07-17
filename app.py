@@ -44,6 +44,21 @@ logger = logging.getLogger(__name__)
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+# Database initialization flag
+database_initialized = False
+
+@app.before_request
+def create_tables():
+    """Create database tables if they don't exist"""
+    global database_initialized
+    if not database_initialized:
+        try:
+            db.create_all()
+            logger.info("Database tables created/verified")
+            database_initialized = True
+        except Exception as e:
+            logger.error(f"Error creating database tables: {str(e)}")
+
 # Routes
 
 @app.route('/')
@@ -82,14 +97,14 @@ def admin():
 
 @app.route('/api/data-sources', methods=['GET'])
 def get_data_sources():
-    """Get all data sources"""
+    """Get all data sources with their tables"""
     try:
         sources = DataSource.query.all()
         sources_data = []
         
         for source in sources:
             source_dict = source.to_dict()
-            # Add table and column counts
+            # Add table and column counts for summary
             source_dict['table_count'] = len(source.tables)
             source_dict['column_count'] = sum(len(table.columns) for table in source.tables)
             sources_data.append(source_dict)
@@ -217,6 +232,29 @@ def delete_data_source(source_id):
         logger.error(f"Error deleting data source: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+# Selective Dictionary Generation API
+@app.route('/api/dictionary/generate-selective', methods=['POST'])
+def generate_selective_dictionary():
+    """Generate dictionary entries for selected tables/columns"""
+    try:
+        data = request.get_json()
+        table_ids = data.get('table_ids', [])
+        column_ids = data.get('column_ids', [])
+        
+        if not table_ids and not column_ids:
+            return jsonify({'error': 'Please select at least one table or column'}), 400
+        
+        result = dictionary_service.generate_selective_dictionary(table_ids, column_ids)
+        return jsonify({
+            'message': 'Dictionary generated successfully',
+            'terms_generated': result.get('terms_generated', 0),
+            'tables_processed': result.get('tables_processed', 0),
+            'columns_processed': result.get('columns_processed', 0)
+        })
+    except Exception as e:
+        logger.error(f"Error generating selective dictionary: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/dictionary', methods=['GET'])
 def get_dictionary():
     """Get all dictionary entries"""
@@ -280,6 +318,37 @@ def generate_dictionary():
         logger.error(f"Error generating dictionary: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+# Selective Embedding Generation API
+@app.route('/api/embeddings/create-selective', methods=['POST'])
+def create_selective_embeddings():
+    """Create embeddings for selected tables/columns"""
+    try:
+        data = request.get_json()
+        scope = data.get('scope')  # 'table' or 'column'
+        table_ids = data.get('table_ids', [])
+        column_ids = data.get('column_ids', [])
+        backend = data.get('backend', 'faiss')
+        model = data.get('model', 'sentence-transformers/all-MiniLM-L6-v2')
+        name = data.get('name')
+        
+        if scope == 'table' and not table_ids:
+            return jsonify({'error': 'Please select at least one table'}), 400
+        elif scope == 'column' and not column_ids:
+            return jsonify({'error': 'Please select at least one column'}), 400
+        
+        job_id = embedding_service.create_selective_index(
+            scope=scope,
+            table_ids=table_ids,
+            column_ids=column_ids,
+            backend=backend,
+            model=model,
+            name=name
+        )
+        return jsonify({'job_id': job_id, 'message': 'Embedding job started'})
+    except Exception as e:
+        logger.error(f"Error creating selective embeddings: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/embeddings/create', methods=['POST'])
 def create_embeddings():
     """Create embeddings index"""
@@ -304,6 +373,8 @@ def get_embedding_status(job_id):
     except Exception as e:
         logger.error(f"Error getting embedding status: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+
 
 @app.route('/api/chat/sessions', methods=['GET'])
 def get_chat_sessions():
@@ -363,14 +434,26 @@ def delete_chat_session(session_id):
 
 @app.route('/api/chat/query', methods=['POST'])
 def process_query():
-    """Process natural language query"""
+    """Process natural language query with step-by-step confirmation"""
     try:
         data = request.get_json()
         query = data['query']
         session_id = data.get('session_id')
+        step = data.get('step', 'extract_entities')  # extract_entities, generate_sql, execute_sql
+        context = data.get('context', {})
         
-        # Process query through RAG pipeline
-        result = rag_pipeline.process_query(query, session_id)
+        if step == 'extract_entities':
+            # Step 1: Extract entities and show to user
+            result = rag_pipeline.extract_entities_step(query, session_id)
+        elif step == 'generate_sql':
+            # Step 2: Generate SQL with entities and show to user
+            result = rag_pipeline.generate_sql_step(query, session_id, context)
+        elif step == 'execute_sql':
+            # Step 3: Execute SQL after user confirmation
+            result = rag_pipeline.execute_sql_step(query, session_id, context)
+        else:
+            # Process complete query (backward compatibility)
+            result = rag_pipeline.process_query(query, session_id)
         
         return jsonify(result)
     except Exception as e:
@@ -501,6 +584,234 @@ def import_dictionary():
         logger.error(f"Error importing dictionary: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+# Additional API endpoints for getting tables and columns for selection
+@app.route('/api/tables', methods=['GET'])
+def get_tables():
+    """Get all tables for selection"""
+    try:
+        tables = Table.query.all()
+        return jsonify([{
+            'id': table.id,
+            'name': table.name,
+            'display_name': table.display_name,
+            'source_id': table.source_id,
+            'source_name': table.data_source.name,
+            'row_count': table.row_count,
+            'column_count': len(table.columns)
+        } for table in tables])
+    except Exception as e:
+        logger.error(f"Error getting tables: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/columns', methods=['GET'])
+def get_columns():
+    """Get all columns for selection"""
+    try:
+        table_id = request.args.get('table_id')
+        query = Column.query
+        if table_id:
+            query = query.filter_by(table_id=int(table_id))
+        
+        columns = query.all()
+        return jsonify([{
+            'id': column.id,
+            'name': column.name,
+            'display_name': column.display_name,
+            'table_id': column.table_id,
+            'table_name': column.table.name,
+            'data_type': column.data_type,
+            'unique_count': column.unique_count
+        } for column in columns])
+    except Exception as e:
+        logger.error(f"Error getting columns: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/data-sources/<int:source_id>/tables/<table_name>/data', methods=['GET'])
+def get_table_data(source_id, table_name):
+    """Get data from a specific table"""
+    try:
+        limit = int(request.args.get('limit', 100))
+        offset = int(request.args.get('offset', 0))
+        
+        source = DataSource.query.get_or_404(source_id)
+        table = Table.query.filter_by(source_id=source_id, name=table_name).first()
+        
+        if not table:
+            return jsonify({'error': f'Table {table_name} not found in source {source.name}'}), 404
+        
+        # Use the SQL executor to get table data
+        sql = f"SELECT * FROM {table_name} LIMIT {limit} OFFSET {offset}"
+        result = sql_executor.execute_query(sql, source_id)
+        
+        if result['status'] == 'success':
+            return jsonify({
+                'data': result.get('data', []),
+                'row_count': result.get('row_count', 0),
+                'total_rows': table.row_count,
+                'table_name': table_name,
+                'source_name': source.name,
+                'columns': [col.to_dict() for col in table.columns]
+            })
+        else:
+            return jsonify({'error': result.get('error', 'Unknown error')}), 500
+            
+    except Exception as e:
+        logger.error(f"Error getting table data: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/data-sources/<int:source_id>/tables', methods=['GET'])
+def get_source_tables(source_id):
+    """Get all tables for a data source with their metadata"""
+    try:
+        source = DataSource.query.get_or_404(source_id)
+        tables = Table.query.filter_by(source_id=source_id).all()
+        
+        tables_data = []
+        for table in tables:
+            table_dict = table.to_dict()
+            table_dict['columns'] = [col.to_dict() for col in table.columns]
+            tables_data.append(table_dict)
+        
+        return jsonify({
+            'source': source.to_dict(),
+            'tables': tables_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting source tables: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/embeddings/indexes', methods=['GET'])
+def get_embedding_indexes():
+    """Get all embedding indexes"""
+    try:
+        from models import EmbeddingIndex
+        
+        indexes = EmbeddingIndex.query.all()
+        indexes_data = []
+        
+        for index in indexes:
+            index_dict = {
+                'id': index.id,
+                'name': index.name,
+                'scope': index.scope,
+                'backend': index.backend,
+                'model_name': index.model_name,
+                'status': index.status,
+                'progress': round(index.progress or 0.0, 2),
+                'item_count': index.item_count or 0,
+                'dimensions': index.dimensions,
+                'index_path': index.index_path,
+                'error_message': index.error_message,
+                'created_at': index.created_at.isoformat() if index.created_at else None,
+                'updated_at': index.updated_at.isoformat() if index.updated_at else None
+            }
+            indexes_data.append(index_dict)
+        
+        return jsonify(indexes_data)
+        
+    except Exception as e:
+        logger.error(f"Error getting embedding indexes: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/embeddings/indexes/<int:index_id>', methods=['GET'])
+def get_embedding_index(index_id):
+    """Get specific embedding index details"""
+    try:
+        from models import EmbeddingIndex
+        
+        index = EmbeddingIndex.query.get_or_404(index_id)
+        
+        index_dict = {
+            'id': index.id,
+            'name': index.name,
+            'scope': index.scope,
+            'backend': index.backend,
+            'model_name': index.model_name,
+            'status': index.status,
+            'progress': round(index.progress or 0.0, 2),
+            'item_count': index.item_count or 0,
+            'dimensions': index.dimensions,
+            'index_path': index.index_path,
+            'error_message': index.error_message,
+            'created_at': index.created_at.isoformat() if index.created_at else None,
+            'updated_at': index.updated_at.isoformat() if index.updated_at else None
+        }
+        
+        return jsonify(index_dict)
+        
+    except Exception as e:
+        logger.error(f"Error getting embedding index: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/embeddings/indexes/<int:index_id>', methods=['DELETE'])
+def delete_embedding_index(index_id):
+    """Delete an embedding index"""
+    try:
+        from models import EmbeddingIndex
+        import os
+        
+        index = EmbeddingIndex.query.get_or_404(index_id)
+        
+        # Delete index files if they exist
+        if index.index_path and os.path.exists(index.index_path):
+            try:
+                os.remove(index.index_path)
+                logger.info(f"Deleted index file: {index.index_path}")
+            except Exception as e:
+                logger.warning(f"Could not delete index file {index.index_path}: {str(e)}")
+        
+        # Delete database record
+        db.session.delete(index)
+        db.session.commit()
+        
+        return jsonify({'message': 'Index deleted successfully'})
+        
+    except Exception as e:
+        logger.error(f"Error deleting embedding index: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/embeddings/job-status/<job_id>', methods=['GET'])
+def get_embedding_job_status(job_id):
+    """Get status of an embedding job"""
+    try:
+        status = embedding_service.get_job_status(job_id)
+        if status:
+            return jsonify(status)
+        else:
+            return jsonify({'error': 'Job not found'}), 404
+            
+    except Exception as e:
+        logger.error(f"Error getting job status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/data-sources/<int:source_id>', methods=['PUT'])
+def update_data_source(source_id):
+    """Update data source metadata"""
+    try:
+        source = DataSource.query.get_or_404(source_id)
+        data = request.get_json()
+        
+        # Update allowed fields
+        if 'name' in data:
+            source.name = data['name']
+        if 'description' in data:
+            if source.metadata is None:
+                source.metadata = {}
+            source.metadata['description'] = data['description']
+        
+        source.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({'message': 'Data source updated successfully'})
+        
+    except Exception as e:
+        logger.error(f"Error updating data source: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+
 # Error handlers
 @app.errorhandler(404)
 def not_found(error):
@@ -509,16 +820,6 @@ def not_found(error):
 @app.errorhandler(500)
 def internal_error(error):
     return jsonify({'error': 'Internal server error'}), 500
-
-# Initialize database
-@app.before_request
-def create_tables():
-    """Create database tables if they don't exist"""
-    try:
-        db.create_all()
-        logger.info("Database tables created/verified")
-    except Exception as e:
-        logger.error(f"Error creating database tables: {str(e)}")
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5555)

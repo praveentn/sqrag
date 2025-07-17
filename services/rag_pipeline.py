@@ -25,12 +25,390 @@ class RAGPipeline:
         self.embedding_service = EmbeddingService()
         self.llm_client = LLMClient()
         self.sql_executor = SQLExecutor()
-        
-    def process_query(self, query: str, session_id: int = None) -> Dict[str, Any]:
-        """Process a natural language query through the RAG pipeline"""
+    
+    def extract_entities_step(self, query: str, session_id: int = None) -> Dict[str, Any]:
+        """Step 1: Extract entities and return for user review"""
         try:
             correlation_id = str(uuid.uuid4())
-            logger.info(f"Processing query [{correlation_id}]: {query[:100]}...")
+            logger.info(f"Extracting entities [{correlation_id}]: {query[:100]}...")
+            
+            # Create or get chat session
+            if session_id:
+                session = ChatSession.query.get(session_id)
+                if not session:
+                    raise ValueError(f"Session {session_id} not found")
+            else:
+                session = ChatSession(
+                    title=self._generate_session_title(query),
+                    created_at=datetime.utcnow()
+                )
+                db.session.add(session)
+                db.session.flush()
+                session_id = session.id
+            
+            # Add user message
+            user_message = ChatMessage(
+                session_id=session_id,
+                role='user',
+                content=query,
+                metadata={'correlation_id': correlation_id, 'step': 'extract_entities'},
+                created_at=datetime.utcnow()
+            )
+            db.session.add(user_message)
+            db.session.flush()
+            
+            # Get conversation context
+            context = self._get_conversation_context(session_id)
+            
+            # Extract entities
+            entities = self._extract_entities(query, context)
+            logger.info(f"[{correlation_id}] Found {len(entities)} entities")
+            
+            # Match entities with dictionary terms
+            matched_terms = self._match_entities_with_dictionary(entities)
+            
+            # Rank candidate tables
+            candidate_tables = self._rank_candidate_tables(entities, query)
+            
+            # Create system message with entity extraction results
+            system_content = self._format_entity_extraction_response(entities, matched_terms, candidate_tables)
+            system_message = ChatMessage(
+                session_id=session_id,
+                role='system',
+                content=system_content,
+                metadata={
+                    'correlation_id': correlation_id,
+                    'step': 'extract_entities',
+                    'entities': entities,
+                    'matched_terms': matched_terms,
+                    'candidate_tables': candidate_tables
+                },
+                created_at=datetime.utcnow()
+            )
+            db.session.add(system_message)
+            db.session.commit()
+            
+            return {
+                'session_id': session_id,
+                'message_id': system_message.id,
+                'step': 'extract_entities',
+                'response': system_content,
+                'entities': entities,
+                'matched_terms': matched_terms,
+                'candidate_tables': [t['name'] for t in candidate_tables],
+                'correlation_id': correlation_id,
+                'next_step': 'generate_sql'
+            }
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error in entity extraction step: {str(e)}")
+            raise
+    
+    def generate_sql_step(self, query: str, session_id: int, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 2: Generate SQL and return for user review"""
+        try:
+            correlation_id = context.get('correlation_id', str(uuid.uuid4()))
+            logger.info(f"Generating SQL [{correlation_id}]: {query[:100]}...")
+            
+            # Get entities and candidate tables from context
+            entities = context.get('entities', [])
+            candidate_tables = self._get_candidate_tables_from_context(context)
+            
+            # Generate SQL
+            sql_result = self._generate_sql(query, entities, candidate_tables, [])
+            logger.info(f"[{correlation_id}] SQL generated with confidence: {sql_result.get('confidence', 0)}")
+            
+            # Create system message with SQL generation results
+            system_content = self._format_sql_generation_response(sql_result, candidate_tables)
+            system_message = ChatMessage(
+                session_id=session_id,
+                role='system',
+                content=system_content,
+                metadata={
+                    'correlation_id': correlation_id,
+                    'step': 'generate_sql',
+                    'sql_result': sql_result,
+                    'candidate_tables': candidate_tables
+                },
+                created_at=datetime.utcnow()
+            )
+            db.session.add(system_message)
+            db.session.commit()
+            
+            return {
+                'session_id': session_id,
+                'message_id': system_message.id,
+                'step': 'generate_sql',
+                'response': system_content,
+                'sql': sql_result.get('sql', ''),
+                'confidence': sql_result.get('confidence', 0),
+                'rationale': sql_result.get('rationale', ''),
+                'tables_used': sql_result.get('tables_used', []),
+                'correlation_id': correlation_id,
+                'next_step': 'execute_sql' if sql_result.get('sql') else None
+            }
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error in SQL generation step: {str(e)}")
+            raise
+    
+    def execute_sql_step(self, query: str, session_id: int, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 3: Execute SQL after user confirmation"""
+        try:
+            correlation_id = context.get('correlation_id', str(uuid.uuid4()))
+            logger.info(f"Executing SQL [{correlation_id}]: {query[:100]}...")
+            
+            # Get SQL from context
+            sql = context.get('sql', '')
+            source_id = context.get('source_id')
+            
+            if not sql:
+                raise ValueError("No SQL provided for execution")
+            
+            # Execute SQL
+            execution_result = self._execute_sql_safely(sql, source_id, session_id, None)
+            
+            # Create assistant response with execution results
+            response_content = self._format_execution_response(sql, execution_result)
+            assistant_message = ChatMessage(
+                session_id=session_id,
+                role='assistant',
+                content=response_content,
+                metadata={
+                    'correlation_id': correlation_id,
+                    'step': 'execute_sql',
+                    'sql': sql,
+                    'execution_result': execution_result
+                },
+                created_at=datetime.utcnow()
+            )
+            db.session.add(assistant_message)
+            
+            # Update session
+            session = ChatSession.query.get(session_id)
+            session.updated_at = datetime.utcnow()
+            
+            db.session.commit()
+            
+            return {
+                'session_id': session_id,
+                'message_id': assistant_message.id,
+                'step': 'execute_sql',
+                'response': response_content,
+                'sql': sql,
+                'execution_result': execution_result,
+                'correlation_id': correlation_id,
+                'completed': True
+            }
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error in SQL execution step: {str(e)}")
+            raise
+    
+    def _match_entities_with_dictionary(self, entities: List[Dict]) -> List[Dict[str, Any]]:
+        """Match extracted entities with dictionary terms"""
+        try:
+            matched_terms = []
+            
+            # Get all approved dictionary terms
+            dict_entries = DictionaryEntry.query.filter_by(approved=True).all()
+            
+            for entity in entities:
+                entity_term = entity['entity'].lower()
+                
+                # Direct matches
+                for entry in dict_entries:
+                    if entity_term == entry.term.lower():
+                        matched_terms.append({
+                            'entity': entity['entity'],
+                            'dictionary_term': entry.term,
+                            'definition': entry.definition,
+                            'category': entry.category,
+                            'match_type': 'exact'
+                        })
+                        break
+                    
+                    # Check synonyms
+                    if entry.synonyms:
+                        for synonym in entry.synonyms:
+                            if entity_term == synonym.lower():
+                                matched_terms.append({
+                                    'entity': entity['entity'],
+                                    'dictionary_term': entry.term,
+                                    'definition': entry.definition,
+                                    'category': entry.category,
+                                    'match_type': 'synonym'
+                                })
+                                break
+            
+            return matched_terms
+            
+        except Exception as e:
+            logger.error(f"Error matching entities with dictionary: {str(e)}")
+            return []
+    
+    def _get_candidate_tables_from_context(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Get candidate tables from context or extract from table names"""
+        candidate_table_names = context.get('candidate_tables', [])
+        candidate_tables = []
+        
+        for table_name in candidate_table_names:
+            table = Table.query.filter_by(name=table_name).first()
+            if table:
+                candidate_tables.append({
+                    'table_id': table.id,
+                    'name': table.name,
+                    'display_name': table.display_name,
+                    'source_id': table.source_id,
+                    'score': 0.8,  # Default score
+                    'reasons': ['From previous step'],
+                    'columns': [col.to_dict() for col in table.columns],
+                    'row_count': table.row_count
+                })
+        
+        return candidate_tables
+    
+    def _format_entity_extraction_response(self, entities: List[Dict], 
+                                         matched_terms: List[Dict], 
+                                         candidate_tables: List[Dict]) -> str:
+        """Format the entity extraction response"""
+        response_parts = []
+        
+        response_parts.append("**🔍 Step 1: Entity Extraction Complete**")
+        response_parts.append("")
+        
+        if entities:
+            response_parts.append(f"**Entities Found ({len(entities)}):**")
+            for entity in entities[:10]:  # Limit display
+                confidence_bar = "█" * int(entity['confidence'] * 10)
+                response_parts.append(f"• `{entity['entity']}` ({entity['type']}) - {confidence_bar} {entity['confidence']:.2f}")
+        else:
+            response_parts.append("**No entities found in your query**")
+        
+        response_parts.append("")
+        
+        if matched_terms:
+            response_parts.append(f"**📚 Dictionary Matches ({len(matched_terms)}):**")
+            for match in matched_terms[:5]:  # Limit display
+                response_parts.append(f"• `{match['entity']}` → **{match['dictionary_term']}**: {match['definition'][:100]}...")
+        else:
+            response_parts.append("**No dictionary matches found**")
+        
+        response_parts.append("")
+        
+        if candidate_tables:
+            response_parts.append(f"**🗃️ Relevant Tables ({len(candidate_tables)}):**")
+            for table in candidate_tables[:5]:  # Limit display
+                score_bar = "█" * int(table['score'] * 10)
+                response_parts.append(f"• `{table['name']}` - {score_bar} {table['score']:.2f}")
+                if table.get('reasons'):
+                    response_parts.append(f"  *{table['reasons'][0]}*")
+        else:
+            response_parts.append("**No relevant tables found**")
+        
+        response_parts.append("")
+        response_parts.append("**Next:** Generate SQL query based on these entities and tables")
+        response_parts.append("*Click 'Continue' to proceed to SQL generation*")
+        
+        return '\n'.join(response_parts)
+    
+    def _format_sql_generation_response(self, sql_result: Dict, candidate_tables: List[Dict]) -> str:
+        """Format the SQL generation response"""
+        response_parts = []
+        
+        response_parts.append("**⚡ Step 2: SQL Generation Complete**")
+        response_parts.append("")
+        
+        if sql_result.get('sql'):
+            confidence = sql_result.get('confidence', 0.0)
+            confidence_bar = "█" * int(confidence * 10)
+            
+            response_parts.append(f"**Generated SQL (Confidence: {confidence_bar} {confidence:.1%}):**")
+            response_parts.append("```sql")
+            response_parts.append(sql_result['sql'])
+            response_parts.append("```")
+            response_parts.append("")
+            
+            if sql_result.get('rationale'):
+                response_parts.append(f"**Explanation:** {sql_result['rationale']}")
+                response_parts.append("")
+            
+            if sql_result.get('tables_used'):
+                response_parts.append(f"**Tables Used:** {', '.join(sql_result['tables_used'])}")
+                response_parts.append("")
+            
+            if sql_result.get('assumptions'):
+                response_parts.append("**Assumptions:**")
+                for assumption in sql_result['assumptions']:
+                    response_parts.append(f"• {assumption}")
+                response_parts.append("")
+            
+            if confidence >= self.rag_config['confidence_threshold']:
+                response_parts.append("**✅ Ready for execution**")
+                response_parts.append("*Click 'Execute SQL' to run this query*")
+            else:
+                response_parts.append("**⚠️ Low confidence - please review**")
+                response_parts.append("*You may want to modify the query or provide feedback*")
+        else:
+            response_parts.append("**❌ Could not generate SQL**")
+            if sql_result.get('error'):
+                response_parts.append(f"**Error:** {sql_result['error']}")
+            response_parts.append("*Please rephrase your query or provide more details*")
+        
+        return '\n'.join(response_parts)
+    
+    def _format_execution_response(self, sql: str, execution_result: Dict) -> str:
+        """Format the execution response"""
+        response_parts = []
+        
+        response_parts.append("**🚀 Step 3: SQL Execution Complete**")
+        response_parts.append("")
+        
+        if execution_result.get('status') == 'success':
+            row_count = execution_result.get('row_count', 0)
+            execution_time = execution_result.get('execution_time', 0.0)
+            
+            response_parts.append(f"**✅ Query executed successfully**")
+            response_parts.append(f"• **Rows returned:** {row_count:,}")
+            response_parts.append(f"• **Execution time:** {execution_time:.3f}s")
+            response_parts.append("")
+            
+            if execution_result.get('preview_data') and len(execution_result['preview_data']) > 0:
+                response_parts.append("**📋 Results Preview:**")
+                preview = execution_result['preview_data']
+                if preview:
+                    # Format as simple table
+                    headers = list(preview[0].keys())
+                    response_parts.append(f"| {' | '.join(headers)} |")
+                    response_parts.append(f"|{' --- |' * len(headers)}")
+                    
+                    for row in preview[:5]:  # Show first 5 rows
+                        values = [str(row.get(h, '')) for h in headers]
+                        response_parts.append(f"| {' | '.join(values)} |")
+                    
+                    if row_count > 5:
+                        response_parts.append(f"*... and {row_count - 5} more rows*")
+        else:
+            response_parts.append("**❌ Query execution failed**")
+            error_msg = execution_result.get('error', 'Unknown error')
+            response_parts.append(f"**Error:** {error_msg}")
+        
+        response_parts.append("")
+        response_parts.append("**SQL Query:**")
+        response_parts.append("```sql")
+        response_parts.append(sql)
+        response_parts.append("```")
+        
+        return '\n'.join(response_parts)
+    
+    def process_query(self, query: str, session_id: int = None) -> Dict[str, Any]:
+        """Process a natural language query through the complete RAG pipeline (backward compatibility)"""
+        try:
+            correlation_id = str(uuid.uuid4())
+            logger.info(f"Processing complete query [{correlation_id}]: {query[:100]}...")
             
             # Create or get chat session
             if session_id:
@@ -260,6 +638,7 @@ class RAGPipeline:
             logger.error(f"Error processing feedback [{correlation_id}]: {str(e)}")
             raise
     
+    # Include all the other existing methods from the original file
     def _extract_entities(self, query: str, context: List[Dict] = None) -> List[Dict[str, Any]]:
         """Extract entities from query using LLM and similarity matching"""
         try:

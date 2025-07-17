@@ -286,9 +286,121 @@ class DataSourceManager:
         except Exception as e:
             logger.error(f"Error extracting database metadata: {str(e)}")
             raise
-    
+        
+    def _extract_database_columns(self, table: Table, inspector, table_name: str, 
+                                schema_name: str, engine) -> None:
+        """Extract column metadata from database table - FIXED VERSION"""
+        columns_info = inspector.get_columns(table_name, schema=schema_name)
+        pk_columns = inspector.get_pk_constraint(table_name, schema=schema_name)
+        fk_columns = inspector.get_foreign_keys(table_name, schema=schema_name)
+        
+        pk_column_names = pk_columns.get('constrained_columns', [])
+        fk_column_names = [fk['constrained_columns'][0] for fk in fk_columns 
+                        if fk.get('constrained_columns')]
+        
+        # Clear existing columns
+        for existing_col in table.columns:
+            db.session.delete(existing_col)
+        
+        for col_info in columns_info:
+            col_name = col_info['name']
+            
+            # Create column record
+            column = Column(
+                name=col_name,
+                display_name=col_name.replace('_', ' ').title(),
+                table_id=table.id,
+                created_at=datetime.utcnow()
+            )
+            
+            # Set basic column properties
+            column.data_type = str(col_info.get('type', 'unknown'))
+            column.is_nullable = col_info.get('nullable', True)
+            column.is_primary_key = col_name in pk_column_names
+            column.is_foreign_key = col_name in fk_column_names
+            column.updated_at = datetime.utcnow()
+            
+            # Handle default value safely
+            default_val = col_info.get('default')
+            if default_val is not None:
+                column.default_value = str(default_val)[:255] if len(str(default_val)) > 255 else str(default_val)
+            else:
+                column.default_value = None
+            
+            # Get sample values and statistics
+            try:
+                full_table_name = f"{schema_name}.{table_name}" if schema_name else table_name
+                
+                # Get sample values
+                sample_query = f"SELECT DISTINCT {col_name} FROM {full_table_name} WHERE {col_name} IS NOT NULL LIMIT 10"
+                sample_result = engine.execute(sample_query)
+                sample_values = [str(row[0]) for row in sample_result]
+                column.sample_values = sample_values
+                
+                # Get basic statistics
+                stats_query = f"""
+                    SELECT 
+                        COUNT(*) as total_count,
+                        COUNT({col_name}) as non_null_count,
+                        COUNT(DISTINCT {col_name}) as unique_count
+                    FROM {full_table_name}
+                """
+                stats_result = engine.execute(stats_query).fetchone()
+                
+                if stats_result:
+                    total_count = stats_result[0]
+                    non_null_count = stats_result[1]
+                    column.null_count = total_count - non_null_count
+                    column.unique_count = stats_result[2]
+                
+                # Get numeric statistics if column is numeric
+                if any(dtype in str(column.data_type).lower() for dtype in ['int', 'float', 'decimal', 'numeric', 'double']):
+                    try:
+                        numeric_stats_query = f"""
+                            SELECT 
+                                MIN({col_name}::NUMERIC) as min_val,
+                                MAX({col_name}::NUMERIC) as max_val,
+                                AVG({col_name}::NUMERIC) as avg_val,
+                                STDDEV({col_name}::NUMERIC) as std_val
+                            FROM {full_table_name}
+                            WHERE {col_name} IS NOT NULL
+                        """
+                        numeric_result = engine.execute(numeric_stats_query).fetchone()
+                        
+                        if numeric_result:
+                            column.min_value = float(numeric_result[0]) if numeric_result[0] is not None else None
+                            column.max_value = float(numeric_result[1]) if numeric_result[1] is not None else None
+                            column.avg_value = float(numeric_result[2]) if numeric_result[2] is not None else None
+                            column.std_dev = float(numeric_result[3]) if numeric_result[3] is not None else None
+                            
+                    except Exception as numeric_error:
+                        logger.warning(f"Could not get numeric statistics for column {col_name}: {numeric_error}")
+                        # Set default values for numeric fields
+                        column.min_value = None
+                        column.max_value = None
+                        column.avg_value = None
+                        column.std_dev = None
+                else:
+                    # Set default values for non-numeric columns
+                    column.min_value = None
+                    column.max_value = None
+                    column.avg_value = None
+                    column.std_dev = None
+                    
+            except Exception as e:
+                logger.warning(f"Could not extract sample data for column {col_name}: {e}")
+                column.sample_values = []
+                column.null_count = 0
+                column.unique_count = 0
+                column.min_value = None
+                column.max_value = None
+                column.avg_value = None
+                column.std_dev = None
+            
+            db.session.add(column)
+
     def _extract_columns_from_dataframe(self, table: Table, df: pd.DataFrame) -> None:
-        """Extract column metadata from pandas DataFrame"""
+        """Extract column metadata from pandas DataFrame - FIXED VERSION"""
         # Clear existing columns
         for existing_col in table.columns:
             db.session.delete(existing_col)
@@ -309,71 +421,41 @@ class DataSourceManager:
             column.unique_count = int(df[col_name].nunique())
             column.updated_at = datetime.utcnow()
             
+            # Set default_value to None for file-based sources
+            column.default_value = None
+            
             # Get sample values (non-null, unique values)
             sample_values = df[col_name].dropna().unique()
             if len(sample_values) > 10:
                 sample_values = sample_values[:10]
             column.sample_values = [str(val) for val in sample_values.tolist()]
             
-            db.session.add(column)
-    
-    def _extract_database_columns(self, table: Table, inspector, table_name: str, 
-                                 schema_name: str, engine) -> None:
-        """Extract column metadata from database table"""
-        columns_info = inspector.get_columns(table_name, schema=schema_name)
-        pk_columns = inspector.get_pk_constraint(table_name, schema=schema_name)
-        fk_columns = inspector.get_foreign_keys(table_name, schema=schema_name)
-        
-        pk_column_names = pk_columns.get('constrained_columns', [])
-        fk_column_names = [fk['constrained_columns'][0] for fk in fk_columns 
-                          if fk.get('constrained_columns')]
-        
-        # Clear existing columns
-        for existing_col in table.columns:
-            db.session.delete(existing_col)
-        
-        for col_info in columns_info:
-            col_name = col_info['name']
-            
-            # Create column record
-            column = Column(
-                name=col_name,
-                display_name=col_name.replace('_', ' ').title(),
-                table_id=table.id,
-                created_at=datetime.utcnow()
-            )
-            
-            column.data_type = str(col_info.get('type', 'unknown'))
-            column.is_nullable = col_info.get('nullable', True)
-            column.is_primary_key = col_name in pk_column_names
-            column.is_foreign_key = col_name in fk_column_names
-            column.updated_at = datetime.utcnow()
-            
-            # Get sample values
-            try:
-                full_table_name = f"{schema_name}.{table_name}" if schema_name != 'public' else table_name
-                with engine.connect() as conn:
-                    # Get distinct values (limited)
-                    query = text(f"SELECT DISTINCT {col_name} FROM {full_table_name} WHERE {col_name} IS NOT NULL LIMIT 10")
-                    result = conn.execute(query)
-                    sample_values = [str(row[0]) for row in result.fetchall()]
-                    column.sample_values = sample_values
-                    
-                    # Get unique count
-                    count_query = text(f"SELECT COUNT(DISTINCT {col_name}) FROM {full_table_name}")
-                    count_result = conn.execute(count_query)
-                    column.unique_count = count_result.fetchone()[0]
-                    
-                    # Get null count
-                    null_query = text(f"SELECT COUNT(*) FROM {full_table_name} WHERE {col_name} IS NULL")
-                    null_result = conn.execute(null_query)
-                    column.null_count = null_result.fetchone()[0]
-                    
-            except Exception as e:
-                logger.warning(f"Could not get sample values for {col_name}: {str(e)}")
-                column.sample_values = []
-                column.unique_count = 0
-                column.null_count = 0
+            # Calculate numeric statistics if applicable
+            if pd.api.types.is_numeric_dtype(df[col_name]):
+                try:
+                    numeric_series = pd.to_numeric(df[col_name], errors='coerce').dropna()
+                    if len(numeric_series) > 0:
+                        column.min_value = float(numeric_series.min())
+                        column.max_value = float(numeric_series.max())
+                        column.avg_value = float(numeric_series.mean())
+                        column.std_dev = float(numeric_series.std()) if len(numeric_series) > 1 else 0.0
+                    else:
+                        column.min_value = None
+                        column.max_value = None
+                        column.avg_value = None
+                        column.std_dev = None
+                except Exception as e:
+                    logger.warning(f"Error calculating numeric stats for {col_name}: {e}")
+                    column.min_value = None
+                    column.max_value = None
+                    column.avg_value = None
+                    column.std_dev = None
+            else:
+                # Non-numeric columns
+                column.min_value = None
+                column.max_value = None
+                column.avg_value = None
+                column.std_dev = None
             
             db.session.add(column)
     

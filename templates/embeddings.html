@@ -315,23 +315,87 @@
 let allIndexes = [];
 let currentIndexId = null;
 let activeJobsInterval = null;
+let refreshInterval = null;
 
 document.addEventListener('DOMContentLoaded', function() {
     loadEmbeddingData();
+    loadActiveJobs();
     setupPerformanceChart();
     startActiveJobsMonitoring();
 });
 
 async function loadEmbeddingData() {
     try {
-        await Promise.all([
-            loadIndexes(),
-            loadActiveJobs()
-        ]);
-        updateStatistics();
+        showToast('Loading embedding indexes...', 'info');
+        
+        // Load actual indexes from API
+        const indexes = await apiRequest('/api/embeddings/indexes');
+        
+        allIndexes = indexes;
+        displayIndexes(indexes);
+        
+        // Set up auto-refresh for building indexes
+        setupAutoRefresh();
+        
+        if (indexes.length === 0) {
+            showToast('No embedding indexes found. Create your first index!', 'info');
+        } else {
+            showToast(`Loaded ${indexes.length} embedding indexes`, 'success');
+        }
+        
     } catch (error) {
-        console.error('Error loading embedding data:', error);
-        showToast('Error loading embedding data', 'danger');
+        console.error('Error loading indexes:', error);
+        showToast('Error loading embedding indexes: ' + error.message, 'danger');
+        
+        // Show empty state
+        const container = document.getElementById('indexesContainer');
+        container.innerHTML = `
+            <div class="text-center p-5">
+                <i class="fas fa-exclamation-triangle fa-4x text-danger mb-3"></i>
+                <h5>Error Loading Indexes</h5>
+                <p class="text-muted">${error.message}</p>
+                <button class="btn btn-primary" onclick="loadEmbeddingData()">
+                    <i class="fas fa-refresh me-2"></i>Retry
+                </button>
+            </div>
+        `;
+    }
+}
+
+function setupAutoRefresh() {
+    // Clear existing interval
+    if (refreshInterval) {
+        clearInterval(refreshInterval);
+    }
+    
+    // Only set up auto-refresh if there are building indexes
+    const buildingIndexes = allIndexes.filter(index => 
+        index.status === 'building' || index.status === 'pending'
+    );
+    
+    if (buildingIndexes.length > 0) {
+        refreshInterval = setInterval(async () => {
+            try {
+                // Silently refresh data for building indexes
+                const indexes = await apiRequest('/api/embeddings/indexes');
+                allIndexes = indexes;
+                displayIndexes(indexes);
+                
+                // Stop auto-refresh if no more building indexes
+                const stillBuilding = indexes.filter(index => 
+                    index.status === 'building' || index.status === 'pending'
+                );
+                if (stillBuilding.length === 0) {
+                    clearInterval(refreshInterval);
+                    refreshInterval = null;
+                    showToast('All embedding indexes completed', 'success');
+                }
+            } catch (error) {
+                console.error('Error in auto-refresh:', error);
+                clearInterval(refreshInterval);
+                refreshInterval = null;
+            }
+        }, 5000); // Refresh every 5 seconds
     }
 }
 
@@ -395,9 +459,9 @@ function displayIndexes(indexes) {
     if (indexes.length === 0) {
         container.innerHTML = `
             <div class="text-center p-5">
-                <i class="fas fa-vector-square fa-4x text-muted mb-3"></i>
+                <i class="fas fa-cube fa-4x text-muted mb-3"></i>
                 <h5>No Embedding Indexes</h5>
-                <p class="text-muted">Create your first index to enable semantic search</p>
+                <p class="text-muted">Create your first embedding index to enable semantic search capabilities.</p>
                 <button class="btn btn-primary" onclick="showCreateIndexModal()">
                     <i class="fas fa-plus me-2"></i>Create Index
                 </button>
@@ -406,29 +470,104 @@ function displayIndexes(indexes) {
         return;
     }
     
-    const tableHtml = `
-        <div class="table-responsive">
-            <table class="table table-hover">
-                <thead>
-                    <tr>
-                        <th>Name</th>
-                        <th>Scope</th>
-                        <th>Backend</th>
-                        <th>Status</th>
-                        <th>Progress</th>
-                        <th>Items</th>
-                        <th>Created</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    ${indexes.map(index => createIndexRow(index)).join('')}
-                </tbody>
-            </table>
+    const indexCards = indexes.map(index => createIndexCard(index)).join('');
+    container.innerHTML = indexCards;
+}
+
+function createIndexCard(index) {
+    const statusClass = getStatusClass(index.status);
+    const progressBar = createProgressBar(index.status, index.progress || 0);
+    const backendIcon = getBackendIcon(index.backend);
+    
+    return `
+        <div class="col-md-6 col-lg-4 mb-4">
+            <div class="card h-100 border-0 shadow-sm">
+                <div class="card-header bg-transparent border-0 pb-0">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <div class="d-flex align-items-center">
+                            ${backendIcon}
+                            <span class="ms-2 fw-bold">${index.name}</span>
+                        </div>
+                        <span class="badge ${statusClass}">${index.status}</span>
+                    </div>
+                </div>
+                
+                <div class="card-body">
+                    <div class="mb-3">
+                        <small class="text-muted d-block">Scope</small>
+                        <span class="badge bg-light text-dark">${index.scope}</span>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <small class="text-muted d-block">Progress</small>
+                        ${progressBar}
+                    </div>
+                    
+                    <div class="row">
+                        <div class="col-6">
+                            <small class="text-muted d-block">Items</small>
+                            <span class="fw-bold">${(index.item_count || 0).toLocaleString()}</span>
+                        </div>
+                        <div class="col-6">
+                            <small class="text-muted d-block">Dimensions</small>
+                            <span class="fw-bold">${index.dimensions || 'N/A'}</span>
+                        </div>
+                    </div>
+                    
+                    ${index.model_name ? `
+                        <div class="mt-2">
+                            <small class="text-muted d-block">Model</small>
+                            <small class="text-truncate d-block" title="${index.model_name}">
+                                ${index.model_name}
+                            </small>
+                        </div>
+                    ` : ''}
+                </div>
+                
+                <div class="card-footer bg-transparent border-0">
+                    <div class="btn-group w-100">
+                        <button class="btn btn-outline-primary btn-sm" 
+                                onclick="showIndexDetails(${index.id})" 
+                                title="View Details">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                        <button class="btn btn-outline-secondary btn-sm" 
+                                onclick="testIndex(${index.id})" 
+                                title="Test Search"
+                                ${index.status !== 'ready' ? 'disabled' : ''}>
+                            <i class="fas fa-search"></i>
+                        </button>
+                        <button class="btn btn-outline-warning btn-sm" 
+                                onclick="rebuildIndex(${index.id})" 
+                                title="Rebuild">
+                            <i class="fas fa-refresh"></i>
+                        </button>
+                        <button class="btn btn-outline-danger btn-sm" 
+                                onclick="deleteIndex(${index.id})" 
+                                title="Delete">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                    
+                    <div class="mt-2 text-center">
+                        <small class="text-muted">
+                            Created ${new Date(index.created_at).toLocaleDateString()}
+                        </small>
+                    </div>
+                </div>
+            </div>
         </div>
     `;
-    
-    container.innerHTML = tableHtml;
+}
+
+function getStatusClass(status) {
+    const classes = {
+        'ready': 'bg-success',
+        'building': 'bg-warning',
+        'pending': 'bg-info',
+        'error': 'bg-danger'
+    };
+    return classes[status] || 'bg-secondary';
 }
 
 function createIndexRow(index) {
@@ -439,39 +578,43 @@ function createIndexRow(index) {
     return `
         <tr onclick="showIndexDetails(${index.id})" style="cursor: pointer;">
             <td>
-                <div class="fw-bold">${index.name}</div>
-                ${index.model_name ? `<small class="text-muted">${index.model_name}</small>` : ''}
+                <div class="fw-bold">${escapeHtml(index.name)}</div>
+                ${index.model_name ? `<small class="text-muted">${escapeHtml(index.model_name)}</small>` : ''}
             </td>
             <td>
-                <span class="badge bg-light text-dark">${index.scope.toUpperCase()}</span>
+                <span class="badge bg-secondary">${index.scope}</span>
             </td>
             <td>
-                <div class="d-flex align-items-center">
-                    <i class="${backendIcon} me-2"></i>
-                    ${index.backend.toUpperCase()}
-                </div>
+                ${backendIcon} ${index.backend}
+                ${index.dimensions ? `<br><small class="text-muted">${index.dimensions}D</small>` : ''}
             </td>
             <td>${statusBadge}</td>
-            <td style="width: 150px;">
+            <td style="width: 120px;">
                 ${progressBar}
             </td>
             <td>
-                <span class="badge bg-info">${index.item_count}</span>
-                ${index.dimensions ? `<br><small class="text-muted">${index.dimensions}D</small>` : ''}
+                <span class="fw-bold">${(index.item_count || 0).toLocaleString()}</span>
             </td>
             <td>
-                <small>${new Date(index.created_at).toLocaleDateString()}</small>
+                <small class="text-muted">
+                    ${index.created_at ? new Date(index.created_at).toLocaleDateString() : 'Unknown'}
+                </small>
             </td>
             <td>
                 <div class="btn-group btn-group-sm" onclick="event.stopPropagation();">
+                    <button class="btn btn-outline-primary" onclick="showIndexDetails(${index.id})" title="View Details">
+                        <i class="fas fa-eye"></i>
+                    </button>
                     ${index.status === 'ready' ? `
-                        <button class="btn btn-outline-primary" onclick="testSearch(${index.id})" title="Test Search">
-                            <i class="fas fa-search"></i>
+                        <button class="btn btn-outline-success" onclick="testIndex(${index.id})" title="Test Index">
+                            <i class="fas fa-play"></i>
                         </button>
                     ` : ''}
-                    <button class="btn btn-outline-warning" onclick="rebuildIndex(${index.id})" title="Rebuild">
-                        <i class="fas fa-redo"></i>
-                    </button>
+                    ${index.status === 'error' ? `
+                        <button class="btn btn-outline-warning" onclick="rebuildIndex(${index.id})" title="Rebuild">
+                            <i class="fas fa-redo"></i>
+                        </button>
+                    ` : ''}
                     <button class="btn btn-outline-danger" onclick="deleteIndex(${index.id})" title="Delete">
                         <i class="fas fa-trash"></i>
                     </button>
@@ -483,39 +626,40 @@ function createIndexRow(index) {
 
 function getStatusBadge(status) {
     const badges = {
-        'ready': '<span class="status-badge status-success">Ready</span>',
-        'building': '<span class="status-badge status-warning">Building</span>',
-        'error': '<span class="status-badge status-error">Error</span>',
-        'pending': '<span class="status-badge status-info">Pending</span>'
+        'pending': '<span class="badge bg-secondary">Pending</span>',
+        'building': '<span class="badge bg-warning">Building</span>',
+        'ready': '<span class="badge bg-success">Ready</span>',
+        'error': '<span class="badge bg-danger">Error</span>'
     };
     return badges[status] || badges['pending'];
 }
 
 function createProgressBar(progress, status) {
-    if (status === 'ready') {
-        return '<span class="text-success small"><i class="fas fa-check-circle me-1"></i>Complete</span>';
-    }
-    
-    if (status === 'error') {
-        return '<span class="text-danger small"><i class="fas fa-exclamation-circle me-1"></i>Failed</span>';
-    }
+    const percentage = Math.round(progress || 0);
+    const progressClass = status === 'error' ? 'bg-danger' :
+                         status === 'ready' ? 'bg-success' :
+                         status === 'building' ? 'bg-warning' : 'bg-secondary';
     
     return `
-        <div class="progress progress-custom">
-            <div class="progress-bar" style="width: ${progress}%"></div>
+        <div class="progress" style="height: 6px;">
+            <div class="progress-bar ${progressClass}" 
+                 style="width: ${percentage}%" 
+                 title="${percentage}%">
+            </div>
         </div>
-        <small class="text-muted">${progress}%</small>
+        <small class="text-muted">${percentage}%</small>
     `;
 }
 
 function getBackendIcon(backend) {
     const icons = {
-        'faiss': 'fas fa-rocket',
-        'tfidf': 'fas fa-calculator',
-        'pgvector': 'fas fa-database'
+        'faiss': '<i class="fas fa-search text-primary"></i>',
+        'tfidf': '<i class="fas fa-chart-bar text-warning"></i>',
+        'pgvector': '<i class="fas fa-database text-success"></i>'
     };
-    return icons[backend] || 'fas fa-cog';
+    return icons[backend] || '<i class="fas fa-cube text-muted"></i>';
 }
+
 
 async function loadActiveJobs() {
     try {
@@ -741,11 +885,30 @@ async function createIndex() {
     }
 }
 
-function showIndexDetails(indexId) {
-    const index = allIndexes.find(i => i.id === indexId);
-    if (!index) return;
-    
-    currentIndexId = indexId;
+async function showIndexDetails(indexId) {
+    try {
+        const index = allIndexes.find(i => i.id === indexId);
+        if (!index) {
+            // Fetch latest data
+            const indexData = await apiRequest(`/api/embeddings/indexes/${indexId}`);
+            currentIndexId = indexId;
+            populateIndexDetails(indexData);
+        } else {
+            currentIndexId = indexId;
+            populateIndexDetails(index);
+        }
+        
+        const modal = new bootstrap.Modal(document.getElementById('indexDetailsModal'));
+        modal.show();
+        
+    } catch (error) {
+        console.error('Error showing index details:', error);
+        showToast('Error loading index details: ' + error.message, 'danger');
+    }
+}
+
+
+function populateIndexDetails(index) {
     document.getElementById('indexDetailsTitle').textContent = index.name;
     
     const detailsHtml = `
@@ -753,6 +916,7 @@ function showIndexDetails(indexId) {
             <div class="col-md-6">
                 <h6>Configuration</h6>
                 <ul class="list-unstyled">
+                    <li><strong>ID:</strong> ${index.id}</li>
                     <li><strong>Scope:</strong> ${index.scope}</li>
                     <li><strong>Backend:</strong> ${index.backend}</li>
                     <li><strong>Model:</strong> ${index.model_name || 'N/A'}</li>
@@ -763,37 +927,38 @@ function showIndexDetails(indexId) {
             <div class="col-md-6">
                 <h6>Statistics</h6>
                 <ul class="list-unstyled">
-                    <li><strong>Items:</strong> ${index.item_count}</li>
-                    <li><strong>Progress:</strong> ${index.progress}%</li>
-                    <li><strong>Created:</strong> ${new Date(index.created_at).toLocaleString()}</li>
-                    <li><strong>Updated:</strong> ${new Date(index.updated_at).toLocaleString()}</li>
+                    <li><strong>Items:</strong> ${(index.item_count || 0).toLocaleString()}</li>
+                    <li><strong>Progress:</strong> ${Math.round(index.progress || 0)}%</li>
+                    <li><strong>Index Path:</strong> ${index.index_path ? `<code class="small">${index.index_path}</code>` : 'N/A'}</li>
+                    <li><strong>Created:</strong> ${index.created_at ? new Date(index.created_at).toLocaleString() : 'Unknown'}</li>
+                    <li><strong>Updated:</strong> ${index.updated_at ? new Date(index.updated_at).toLocaleString() : 'Unknown'}</li>
                 </ul>
             </div>
         </div>
         
-        ${index.status === 'error' ? `
+        ${index.status === 'error' && index.error_message ? `
             <div class="alert alert-danger mt-3">
-                <h6>Error Details</h6>
-                <p>Index build failed. Please check the logs or try rebuilding.</p>
+                <h6><i class="fas fa-exclamation-triangle me-2"></i>Error Details</h6>
+                <p class="mb-0">${escapeHtml(index.error_message)}</p>
             </div>
         ` : ''}
         
         ${index.status === 'building' ? `
-            <div class="mt-3">
-                <h6>Build Progress</h6>
-                <div class="progress progress-custom mb-2">
-                    <div class="progress-bar" style="width: ${index.progress}%"></div>
+            <div class="alert alert-info mt-3">
+                <h6><i class="fas fa-cog fa-spin me-2"></i>Building in Progress</h6>
+                <div class="progress mt-2">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                         style="width: ${Math.round(index.progress || 0)}%">
+                        ${Math.round(index.progress || 0)}%
+                    </div>
                 </div>
-                <small class="text-muted">Building... ${index.progress}% complete</small>
             </div>
         ` : ''}
     `;
     
     document.getElementById('indexDetailsContent').innerHTML = detailsHtml;
-    
-    const modal = new bootstrap.Modal(document.getElementById('indexDetailsModal'));
-    modal.show();
 }
+
 
 function testSearch(indexId) {
     const index = allIndexes.find(i => i.id === indexId);
@@ -813,6 +978,12 @@ function testSearch(indexId) {
 function testIndexSearch() {
     testSearch(currentIndexId);
 }
+
+async function testIndex(indexId) {
+    // Implement index testing functionality
+    showToast('Index testing feature coming soon', 'info');
+}
+
 
 async function executeSearch() {
     try {
@@ -881,25 +1052,35 @@ async function executeSearch() {
 }
 
 async function rebuildIndex(indexId) {
-    const index = allIndexes.find(i => i.id === indexId);
-    if (!index) return;
+    if (!confirm('Are you sure you want to rebuild this index? This will overwrite the existing index.')) {
+        return;
+    }
     
-    if (confirm(`Are you sure you want to rebuild "${index.name}"? This will take some time.`)) {
-        try {
-            // Simulate rebuild
-            index.status = 'building';
-            index.progress = 0;
-            
-            showToast('Index rebuild started', 'success');
-            updateStatistics();
-            displayIndexes(allIndexes);
-            
-        } catch (error) {
-            console.error('Error rebuilding index:', error);
-            showToast('Error rebuilding index: ' + error.message, 'danger');
-        }
+    try {
+        const index = allIndexes.find(i => i.id === indexId);
+        if (!index) return;
+        
+        // Trigger rebuild by creating index with overwrite flag
+        const result = await apiRequest('/api/embeddings/create', {
+            method: 'POST',
+            body: JSON.stringify({
+                name: index.name + '_rebuild',
+                scope: index.scope,
+                backend: index.backend,
+                model: index.model_name,
+                overwrite: true
+            })
+        });
+        
+        showToast('Index rebuild started', 'success');
+        loadEmbeddingData(); // Refresh to show building status
+        
+    } catch (error) {
+        console.error('Error rebuilding index:', error);
+        showToast('Error rebuilding index: ' + error.message, 'danger');
     }
 }
+
 
 function rebuildIndexFromDetails() {
     bootstrap.Modal.getInstance(document.getElementById('indexDetailsModal')).hide();
@@ -907,24 +1088,31 @@ function rebuildIndexFromDetails() {
 }
 
 async function deleteIndex(indexId) {
-    const index = allIndexes.find(i => i.id === indexId);
-    if (!index) return;
+    if (!confirm('Are you sure you want to delete this embedding index? This action cannot be undone.')) {
+        return;
+    }
     
-    if (confirm(`Are you sure you want to delete "${index.name}"? This action cannot be undone.`)) {
-        try {
-            // Remove from array (simulate API call)
-            allIndexes = allIndexes.filter(i => i.id !== indexId);
-            
-            showToast('Index deleted successfully', 'success');
-            updateStatistics();
-            displayIndexes(allIndexes);
-            
-        } catch (error) {
-            console.error('Error deleting index:', error);
-            showToast('Error deleting index: ' + error.message, 'danger');
-        }
+    try {
+        await apiRequest(`/api/embeddings/indexes/${indexId}`, { method: 'DELETE' });
+        showToast('Embedding index deleted successfully', 'success');
+        loadEmbeddingData(); // Refresh the list
+        
+        // Close modal if it's open
+        const modal = bootstrap.Modal.getInstance(document.getElementById('indexDetailsModal'));
+        if (modal) modal.hide();
+        
+    } catch (error) {
+        console.error('Error deleting index:', error);
+        showToast('Error deleting index: ' + error.message, 'danger');
     }
 }
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 
 function deleteIndexFromDetails() {
     bootstrap.Modal.getInstance(document.getElementById('indexDetailsModal')).hide();
@@ -951,10 +1139,11 @@ async function cleanupJobs() {
     }
 }
 
-// Cleanup interval when page unloads
+// Clean up interval when page unloads
 window.addEventListener('beforeunload', function() {
-    if (activeJobsInterval) {
-        clearInterval(activeJobsInterval);
+    if (refreshInterval) {
+        clearInterval(refreshInterval);
+        refreshInterval = null;
     }
 });
 </script>

@@ -6,7 +6,7 @@ import json
 db = SQLAlchemy()
 
 class DataSource(db.Model):
-    """Data source _metadata table"""
+    """Data source metadata table"""
     __tablename__ = 'data_sources'
     
     id = db.Column(db.Integer, primary_key=True)
@@ -17,6 +17,7 @@ class DataSource(db.Model):
     _metadata = db.Column(db.JSON)
     row_count = db.Column(db.Integer, default=0)
     last_refresh = db.Column(db.DateTime)
+    status = db.Column(db.String(50), default='active')  # active, error, connecting
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -26,22 +27,36 @@ class DataSource(db.Model):
     def __repr__(self):
         return f'<DataSource {self.name}>'
     
+    @property
+    def _metadata(self):
+        """Getter for metadata to handle the underscore prefix"""
+        return self._metadata
+    
+    @_metadata.setter
+    def _metadata(self, value):
+        """Setter for metadata to handle the underscore prefix"""
+        self._metadata = value
+        
     def to_dict(self):
+        """Convert DataSource to dictionary with proper decimal rounding"""
         return {
             'id': self.id,
             'name': self.name,
             'type': self.type,
             'connection_string': self.connection_string,
             'file_path': self.file_path,
-            '_metadata': self._metadata,
+            'status': self.status,
             'row_count': self.row_count,
+            'metadata': self.metadata,
             'last_refresh': self.last_refresh.isoformat() if self.last_refresh else None,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat()
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'tables': [table.to_dict() for table in self.tables] if hasattr(self, 'tables') else [],
+            'table_count': len(self.tables) if hasattr(self, 'tables') else 0
         }
 
 class Table(db.Model):
-    """Table _metadata"""
+    """Table metadata"""
     __tablename__ = 'tables'
     
     id = db.Column(db.Integer, primary_key=True)
@@ -60,24 +75,25 @@ class Table(db.Model):
     
     def __repr__(self):
         return f'<Table {self.name}>'
-    
+        
     def to_dict(self):
+        """Convert Table to dictionary with proper decimal rounding"""
         return {
             'id': self.id,
             'name': self.name,
             'display_name': self.display_name,
+            'source_id': self.source_id,
             'description': self.description,
             'schema_name': self.schema_name,
-            'source_id': self.source_id,
             'row_count': self.row_count,
             'sampling_stats': self.sampling_stats,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
-            'columns': [col.to_dict() for col in self.columns]
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'columns': [col.to_dict() for col in self.columns] if hasattr(self, 'columns') else []
         }
 
 class Column(db.Model):
-    """Column _metadata"""
+    """Column metadata"""
     __tablename__ = 'columns'
     
     id = db.Column(db.Integer, primary_key=True)
@@ -88,32 +104,43 @@ class Column(db.Model):
     is_nullable = db.Column(db.Boolean, default=True)
     is_primary_key = db.Column(db.Boolean, default=False)
     is_foreign_key = db.Column(db.Boolean, default=False)
+    default_value = db.Column(db.String(255))  # Added missing default_value column
     table_id = db.Column(db.Integer, db.ForeignKey('tables.id'), nullable=False)
     sample_values = db.Column(db.JSON)  # Array of sample values
     unique_count = db.Column(db.Integer)
     null_count = db.Column(db.Integer)
+    min_value = db.Column(db.Float)  # Added statistical columns
+    max_value = db.Column(db.Float)
+    avg_value = db.Column(db.Float)
+    std_dev = db.Column(db.Float)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     def __repr__(self):
         return f'<Column {self.name}>'
-    
+        
     def to_dict(self):
+        """Convert Column to dictionary with proper decimal rounding"""
         return {
             'id': self.id,
             'name': self.name,
             'display_name': self.display_name,
-            'description': self.description,
+            'table_id': self.table_id,
             'data_type': self.data_type,
             'is_nullable': self.is_nullable,
             'is_primary_key': self.is_primary_key,
             'is_foreign_key': self.is_foreign_key,
-            'table_id': self.table_id,
-            'sample_values': self.sample_values,
-            'unique_count': self.unique_count,
+            'default_value': self.default_value,
+            'description': self.description,
             'null_count': self.null_count,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat()
+            'unique_count': self.unique_count,
+            'min_value': round(self.min_value, 3) if self.min_value is not None else None,
+            'max_value': round(self.max_value, 3) if self.max_value is not None else None,
+            'avg_value': round(self.avg_value, 3) if self.avg_value is not None else None,
+            'std_dev': round(self.std_dev, 3) if self.std_dev is not None else None,
+            'sample_values': self.sample_values,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
 class DictionaryEntry(db.Model):
@@ -124,11 +151,13 @@ class DictionaryEntry(db.Model):
     term = db.Column(db.String(255), nullable=False, unique=True)
     definition = db.Column(db.Text, nullable=False)
     category = db.Column(db.String(100), default='general')
+    tags = db.Column(db.JSON)  # Added missing tags column - Array of tags
     synonyms = db.Column(db.JSON)  # Array of synonyms
     abbreviations = db.Column(db.JSON)  # Array of abbreviations
     source_table = db.Column(db.String(255))  # Source table if auto-generated
     source_column = db.Column(db.String(255))  # Source column if auto-generated
-    approved = db.Column(db.Boolean, default=False)
+    is_approved = db.Column(db.Boolean, default=False)  # Fixed: changed from 'approved' to 'is_approved'
+    confidence_score = db.Column(db.Float)  # Added missing confidence_score column
     version = db.Column(db.Integer, default=1)
     created_by = db.Column(db.String(255))
     approved_by = db.Column(db.String(255))
@@ -138,22 +167,35 @@ class DictionaryEntry(db.Model):
     def __repr__(self):
         return f'<DictionaryEntry {self.term}>'
     
+    # For backward compatibility with existing code that uses 'approved'
+    @property
+    def approved(self):
+        return self.is_approved
+    
+    @approved.setter
+    def approved(self, value):
+        self.is_approved = value
+        
     def to_dict(self):
+        """Convert DictionaryEntry to dictionary"""
         return {
             'id': self.id,
             'term': self.term,
             'definition': self.definition,
             'category': self.category,
-            'synonyms': self.synonyms or [],
-            'abbreviations': self.abbreviations or [],
+            'tags': self.tags,
+            'synonyms': self.synonyms,
+            'abbreviations': self.abbreviations,
             'source_table': self.source_table,
             'source_column': self.source_column,
-            'approved': self.approved,
+            'is_approved': self.is_approved,
+            'approved': self.is_approved,  # Backward compatibility
+            'confidence_score': round(self.confidence_score, 3) if self.confidence_score is not None else None,
             'version': self.version,
             'created_by': self.created_by,
             'approved_by': self.approved_by,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat()
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
 class EmbeddingIndex(db.Model):
@@ -176,22 +218,23 @@ class EmbeddingIndex(db.Model):
     
     def __repr__(self):
         return f'<EmbeddingIndex {self.name}>'
-    
+        
     def to_dict(self):
+        """Convert EmbeddingIndex to dictionary"""
         return {
             'id': self.id,
             'name': self.name,
             'scope': self.scope,
             'backend': self.backend,
             'model_name': self.model_name,
+            'status': self.status,
+            'progress': round(self.progress, 2) if self.progress is not None else 0.0,
+            'item_count': self.item_count or 0,
             'dimensions': self.dimensions,
             'index_path': self.index_path,
-            'status': self.status,
-            'progress': round(self.progress, 2),
             'error_message': self.error_message,
-            'item_count': self.item_count,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat()
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
 class ChatSession(db.Model):
@@ -211,12 +254,22 @@ class ChatSession(db.Model):
     def __repr__(self):
         return f'<ChatSession {self.title}>'
     
+    @property
+    def _metadata(self):
+        """Getter for metadata to handle the underscore prefix"""
+        return self._metadata
+    
+    @_metadata.setter
+    def _metadata(self, value):
+        """Setter for metadata to handle the underscore prefix"""
+        self._metadata = value
+    
     def to_dict(self):
         return {
             'id': self.id,
             'title': self.title,
             'user_id': self.user_id,
-            '_metadata': self._metadata,
+            'metadata': self.metadata,
             'message_count': len(self.messages),
             'created_at': self.created_at.isoformat(),
             'updated_at': self.updated_at.isoformat()
@@ -231,11 +284,20 @@ class ChatMessage(db.Model):
     role = db.Column(db.String(20), nullable=False)  # user, assistant, system
     content = db.Column(db.Text, nullable=False)
     _metadata = db.Column(db.JSON)  # Store SQL, entities, confidence, etc.
-    parent_message_id = db.Column(db.Integer, db.ForeignKey('chat_messages.id'))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     
     def __repr__(self):
         return f'<ChatMessage {self.role}: {self.content[:50]}...>'
+    
+    @property
+    def _metadata(self):
+        """Getter for metadata to handle the underscore prefix"""
+        return self._metadata
+    
+    @_metadata.setter
+    def _metadata(self, value):
+        """Setter for metadata to handle the underscore prefix"""
+        self._metadata = value
     
     def to_dict(self):
         return {
@@ -243,11 +305,10 @@ class ChatMessage(db.Model):
             'session_id': self.session_id,
             'role': self.role,
             'content': self.content,
-            '_metadata': self._metadata,
-            'parent_message_id': self.parent_message_id,
-            'created_at': self.created_at.isoformat()
+            'metadata': self.metadata,
+            'timestamp': self.timestamp.isoformat()
         }
-
+    
 class QueryExecution(db.Model):
     """Query execution history"""
     __tablename__ = 'query_executions'
@@ -311,4 +372,4 @@ class SystemLog(db.Model):
             '_metadata': self._metadata,
             'created_at': self.created_at.isoformat()
         }
-    
+

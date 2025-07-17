@@ -104,8 +104,78 @@ class DictionaryService:
             logger.error(f"Error deleting dictionary entry {entry_id}: {str(e)}")
             raise
     
+    def generate_selective_dictionary(self, table_ids: List[int] = None, 
+                                    column_ids: List[int] = None) -> Dict[str, Any]:
+        """Generate dictionary entries for selected tables and columns"""
+        try:
+            stats = {
+                'terms_generated': 0,
+                'columns_processed': 0,
+                'tables_processed': 0,
+                'categories': defaultdict(int)
+            }
+            
+            # Process selected tables
+            if table_ids:
+                tables = Table.query.filter(Table.id.in_(table_ids)).all()
+                for table in tables:
+                    stats['tables_processed'] += 1
+                    logger.info(f"Processing table: {table.name}")
+                    
+                    # Generate table-level terms
+                    table_terms = self._extract_table_terms(table)
+                    for term_data in table_terms:
+                        self._create_or_update_term(term_data, stats)
+                    
+                    # Process all columns in selected tables
+                    for column in table.columns:
+                        stats['columns_processed'] += 1
+                        
+                        # Generate column-level terms
+                        column_terms = self._extract_column_terms(column)
+                        for term_data in column_terms:
+                            self._create_or_update_term(term_data, stats)
+                        
+                        # Extract terms from sample values
+                        if column.sample_values:
+                            value_terms = self._extract_value_terms(column)
+                            for term_data in value_terms:
+                                self._create_or_update_term(term_data, stats)
+            
+            # Process selected columns (individual columns not part of table selection)
+            if column_ids:
+                columns = Column.query.filter(Column.id.in_(column_ids)).all()
+                for column in columns:
+                    # Skip if already processed as part of table
+                    if table_ids and column.table_id in table_ids:
+                        continue
+                        
+                    stats['columns_processed'] += 1
+                    logger.info(f"Processing column: {column.table.name}.{column.name}")
+                    
+                    # Generate column-level terms
+                    column_terms = self._extract_column_terms(column)
+                    for term_data in column_terms:
+                        self._create_or_update_term(term_data, stats)
+                    
+                    # Extract terms from sample values
+                    if column.sample_values:
+                        value_terms = self._extract_value_terms(column)
+                        for term_data in value_terms:
+                            self._create_or_update_term(term_data, stats)
+            
+            db.session.commit()
+            
+            logger.info(f"Generated {stats['terms_generated']} dictionary terms for selected items")
+            return dict(stats)
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error generating selective dictionary: {str(e)}")
+            raise
+    
     def auto_generate_dictionary(self) -> Dict[str, Any]:
-        """Auto-generate dictionary entries from data sources"""
+        """Auto-generate dictionary from all data sources"""
         try:
             stats = {
                 'terms_generated': 0,
@@ -157,7 +227,7 @@ class DictionaryService:
             raise
     
     def _extract_table_terms(self, table: Table) -> List[Dict[str, Any]]:
-        """Extract terms from table _metadata"""
+        """Extract terms from table metadata"""
         terms = []
         
         # Table name
@@ -187,7 +257,7 @@ class DictionaryService:
         return terms
     
     def _extract_column_terms(self, column: Column) -> List[Dict[str, Any]]:
-        """Extract terms from column _metadata"""
+        """Extract terms from column metadata"""
         terms = []
         
         # Column name

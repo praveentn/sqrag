@@ -10,6 +10,7 @@ and starts the Flask development server.
 import os
 import sys
 import logging
+import argparse
 from pathlib import Path
 
 # Add the project root to Python path
@@ -100,102 +101,50 @@ def check_optional_dependencies():
         except ImportError:
             logger.warning(f"⚠ Optional package '{package}' not found: {warning}")
 
-def setup_sample_data():
-    """Setup sample data for demonstration (optional)"""
+def cleanup_sample_data():
+    """Clean up all sample data from the database"""
     try:
         with app.app_context():
-            from models import DictionaryEntry, DataSource, Table, Column
-            import pandas as pd
-            import os
+            from models import DataSource, DictionaryEntry, EmbeddingIndex, ChatSession, QueryExecution
             
-            # Check if we already have sample data
-            if DataSource.query.count() > 0:
-                logger.info("Sample data sources already exist, skipping setup")
+            # Count existing data
+            sources_count = DataSource.query.count()
+            dict_count = DictionaryEntry.query.count()
+            embed_count = EmbeddingIndex.query.count()
+            chat_count = ChatSession.query.count()
+            query_count = QueryExecution.query.count()
+            
+            if sources_count == 0 and dict_count == 0 and embed_count == 0:
+                logger.info("No data to clean up")
                 return
             
-            # Create sample CSV data
-            sample_customers = pd.DataFrame({
-                'customer_id': [1, 2, 3, 4, 5],
-                'customer_name': ['John Doe', 'Jane Smith', 'Bob Johnson', 'Alice Brown', 'Charlie Wilson'],
-                'email': ['john@example.com', 'jane@example.com', 'bob@example.com', 'alice@example.com', 'charlie@example.com'],
-                'city': ['New York', 'Los Angeles', 'Chicago', 'Houston', 'Phoenix'],
-                'signup_date': ['2024-01-15', '2024-01-20', '2024-02-01', '2024-02-10', '2024-02-15']
-            })
+            # Delete all data
+            QueryExecution.query.delete()
+            ChatSession.query.delete()  # This will cascade to ChatMessage
+            EmbeddingIndex.query.delete()
+            DictionaryEntry.query.delete()
             
-            sample_orders = pd.DataFrame({
-                'order_id': [101, 102, 103, 104, 105, 106],
-                'customer_id': [1, 2, 1, 3, 2, 4],
-                'product_name': ['Laptop', 'Mouse', 'Keyboard', 'Monitor', 'Headphones', 'Webcam'],
-                'order_amount': [999.99, 29.99, 79.99, 299.99, 199.99, 89.99],
-                'order_date': ['2024-03-01', '2024-03-02', '2024-03-05', '2024-03-07', '2024-03-10', '2024-03-12'],
-                'status': ['Completed', 'Completed', 'Pending', 'Completed', 'Shipped', 'Completed']
-            })
+            # Delete data sources (this will cascade to tables and columns)
+            for source in DataSource.query.all():
+                # Delete associated files
+                if source.file_path and os.path.exists(source.file_path):
+                    try:
+                        os.remove(source.file_path)
+                        logger.info(f"Deleted file: {source.file_path}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete file {source.file_path}: {str(e)}")
             
-            # Ensure uploads directory exists
-            uploads_dir = os.path.join(project_root, 'uploads')
-            os.makedirs(uploads_dir, exist_ok=True)
+            DataSource.query.delete()
             
-            # Save sample CSV files
-            customers_file = os.path.join(uploads_dir, 'sample_customers.csv')
-            orders_file = os.path.join(uploads_dir, 'sample_orders.csv')
+            db.session.commit()
             
-            sample_customers.to_csv(customers_file, index=False)
-            sample_orders.to_csv(orders_file, index=False)
-            
-            # Create data sources
-            from services.data_source_manager import DataSourceManager
-            dsm = DataSourceManager()
-            
-            # Create customers data source
-            customers_source = dsm.create_source(
-                name='Sample Customers',
-                type='csv',
-                file_path=customers_file,
-                _metadata={'description': 'Sample customer data for demonstration'}
-            )
-            
-            # Create orders data source
-            orders_source = dsm.create_source(
-                name='Sample Orders',
-                type='csv',
-                file_path=orders_file,
-                _metadata={'description': 'Sample order data for demonstration'}
-            )
-            
-            logger.info("Created sample data sources with CSV files")
-            
-            # Create some sample dictionary entries if they don't exist
-            if DictionaryEntry.query.count() == 0:
-                sample_entries = [
-                    {
-                        'term': 'customer',
-                        'definition': 'An individual or organization that purchases goods or services',
-                        'category': 'business_term',
-                        'approved': True
-                    },
-                    {
-                        'term': 'revenue',
-                        'definition': 'The total amount of income generated by a business',
-                        'category': 'financial',
-                        'approved': True
-                    },
-                    {
-                        'term': 'order',
-                        'definition': 'A request to purchase goods or services',
-                        'category': 'business_term',
-                        'approved': True
-                    }
-                ]
-                
-                for entry_data in sample_entries:
-                    entry = DictionaryEntry(**entry_data)
-                    db.session.add(entry)
-                
-                db.session.commit()
-                logger.info(f"Created {len(sample_entries)} sample dictionary entries")
+            logger.info(f"Cleaned up: {sources_count} sources, {dict_count} dictionary entries, "
+                       f"{embed_count} embeddings, {chat_count} chats, {query_count} queries")
             
     except Exception as e:
-        logger.error(f"Error setting up sample data: {str(e)}")
+        db.session.rollback()
+        logger.error(f"Error cleaning up sample data: {str(e)}")
+        raise
 
 def print_startup_info():
     """Print useful startup information"""
@@ -225,20 +174,32 @@ def print_startup_info():
 def main():
     """Main startup function"""
     try:
+        # Parse command line arguments
+        parser = argparse.ArgumentParser(description='RAG Data Platform')
+        parser.add_argument('--cleanup', action='store_true', 
+                          help='Clean up all existing data before starting')
+        parser.add_argument('--sample-data', action='store_true',
+                          help='Create sample data for demonstration')
+        parser.add_argument('--port', type=int, default=5555,
+                          help='Port to run the server on (default: 5555)')
+        parser.add_argument('--host', default='0.0.0.0',
+                          help='Host to bind to (default: 0.0.0.0)')
+        parser.add_argument('--debug', action='store_true',
+                          help='Run in debug mode')
+        
+        args = parser.parse_args()
+        
         logger.info("Starting RAG Data Platform...")
         
         # Check dependencies
-        # check_dependencies()
-        # check_optional_dependencies()
+        check_dependencies()
+        check_optional_dependencies()
         
         # Create necessary directories
-        # create_directories()
+        create_directories()
         
         # Initialize database
         init_database()
-        
-        # Setup sample data (optional)
-        # setup_sample_data()
         
         # Print startup information
         print_startup_info()
@@ -246,9 +207,9 @@ def main():
         # Start the Flask application
         logger.info("Starting Flask development server...")
         app.run(
-            host='0.0.0.0',
-            port=5555,
-            debug=True,
+            host=args.host,
+            port=args.port,
+            debug=args.debug,
             use_reloader=False  # Disable reloader to avoid running this script twice
         )
         

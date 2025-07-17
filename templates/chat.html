@@ -205,9 +205,15 @@
 let currentSessionId = null;
 let currentMessageId = null;
 let isProcessing = false;
+let currentStep = null;
+let currentContext = {};
+let pendingContinue = false;
 
 document.addEventListener('DOMContentLoaded', function() {
-    loadChatSessions();
+    // Initialize session if needed
+    if (!currentSessionId) {
+        loadChatSessions();
+    }
 });
 
 async function loadChatSessions() {
@@ -431,49 +437,85 @@ function handleQueryKeydown(event) {
 }
 
 async function sendQuery() {
-    const queryInput = document.getElementById('queryInput');
-    const query = queryInput.value.trim();
+    const input = document.getElementById('queryInput');
+    const query = input.value.trim();
     
-    if (!query || isProcessing) return;
+    if (!query) return;
     
-    if (!currentSessionId) {
-        await newChatSession();
-    }
+    // Clear previous continue UI
+    removeContinueUI();
     
-    isProcessing = true;
+    input.value = '';
+    addMessageToUI('user', query);
+    
+    // Show loading message
+    addMessageToUI('assistant', '🔍 Analyzing your query...', null, false);
     
     try {
-        // Clear input and disable send button
-        queryInput.value = '';
-        const sendButton = document.getElementById('sendButton');
-        showLoading(sendButton);
-        
-        // Add user message to UI immediately
-        addMessageToUI('user', query);
-        
-        // Send query to backend
         const response = await apiRequest('/api/chat/query', {
             method: 'POST',
             body: JSON.stringify({
                 query: query,
-                session_id: currentSessionId
+                session_id: currentSessionId,
+                step: 'extract_entities',  // Start with entity extraction
+                context: { original_query: query }
             })
         });
         
-        // Add assistant response to UI
-        addMessageToUI('assistant', response.response, response);
+        // Remove loading message
+        const messages = document.querySelectorAll('.message.assistant');
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && lastMessage.textContent.includes('Analyzing')) {
+            lastMessage.remove();
+        }
         
-        // Update current message ID for feedback
-        currentMessageId = response.message_id;
+        handleQueryResponse(response);
         
     } catch (error) {
         console.error('Error sending query:', error);
+        
+        // Remove loading message
+        const messages = document.querySelectorAll('.message.assistant');
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && lastMessage.textContent.includes('Analyzing')) {
+            lastMessage.remove();
+        }
+        
         addMessageToUI('assistant', `Error: ${error.message}`, null, true);
-        showToast('Error processing query', 'danger');
-    } finally {
-        isProcessing = false;
-        hideLoading(document.getElementById('sendButton'));
-        queryInput.focus();
+        showToast('Error sending query: ' + error.message, 'danger');
+    }
+}
+
+function handleQueryResponse(response) {
+    currentSessionId = response.session_id;
+    
+    // Add the assistant response
+    const metadata = {
+        sql: response.sql,
+        execution_result: response.execution_result,
+        confidence: response.confidence,
+        message_id: response.message_id
+    };
+    
+    addMessageToUI('assistant', response.response, metadata);
+    
+    // Check if we need to show continue button
+    if (response.next_step) {
+        currentContext = {
+            ...currentContext,
+            entities: response.entities,
+            matched_terms: response.matched_terms,
+            candidate_tables: response.candidate_tables,
+            sql: response.sql,
+            confidence: response.confidence,
+            rationale: response.rationale,
+            tables_used: response.tables_used,
+            correlation_id: response.correlation_id,
+            source_id: response.candidate_tables && response.candidate_tables.length > 0 ? 
+                       response.candidate_tables[0].source_id : null
+        };
+        
+        addContinueUI(response.step, currentContext);
     }
 }
 
@@ -742,5 +784,135 @@ function downloadResults() {
     // This would download the current results as CSV
     showToast('Download feature not fully implemented', 'info');
 }
+
+
+function addContinueUI(step, context) {
+    currentStep = step;
+    currentContext = context;
+    pendingContinue = true;
+    
+    // Add continue button after the last message
+    const container = document.getElementById('chatMessages');
+    const existingContinue = document.getElementById('continueButtonContainer');
+    if (existingContinue) {
+        existingContinue.remove();
+    }
+    
+    if (step === 'extract_entities') {
+        const continueDiv = document.createElement('div');
+        continueDiv.id = 'continueButtonContainer';
+        continueDiv.className = 'text-center mt-3 mb-3';
+        continueDiv.innerHTML = `
+            <div class="card border-primary">
+                <div class="card-body py-2">
+                    <button class="btn btn-primary me-2" onclick="continueToNextStep()">
+                        <i class="fas fa-arrow-right me-2"></i>Continue to SQL Generation
+                    </button>
+                    <button class="btn btn-outline-secondary" onclick="modifyEntities()">
+                        <i class="fas fa-edit me-2"></i>Modify Entities
+                    </button>
+                </div>
+            </div>
+        `;
+        container.appendChild(continueDiv);
+    } else if (step === 'generate_sql') {
+        const continueDiv = document.createElement('div');
+        continueDiv.id = 'continueButtonContainer';
+        continueDiv.className = 'text-center mt-3 mb-3';
+        continueDiv.innerHTML = `
+            <div class="card border-success">
+                <div class="card-body py-2">
+                    <button class="btn btn-success me-2" onclick="continueToNextStep()">
+                        <i class="fas fa-play me-2"></i>Execute SQL
+                    </button>
+                    <button class="btn btn-outline-warning me-2" onclick="modifySQL()">
+                        <i class="fas fa-edit me-2"></i>Modify SQL
+                    </button>
+                    <button class="btn btn-outline-secondary" onclick="startOver()">
+                        <i class="fas fa-redo me-2"></i>Start Over
+                    </button>
+                </div>
+            </div>
+        `;
+        container.appendChild(continueDiv);
+    }
+    
+    // Scroll to bottom
+    container.scrollTop = container.scrollHeight;
+}
+
+function removeContinueUI() {
+    const existingContinue = document.getElementById('continueButtonContainer');
+    if (existingContinue) {
+        existingContinue.remove();
+    }
+    pendingContinue = false;
+}
+
+async function continueToNextStep() {
+    if (!currentStep || !pendingContinue) return;
+    
+    try {
+        removeContinueUI();
+        
+        let nextStep;
+        if (currentStep === 'extract_entities') {
+            nextStep = 'generate_sql';
+            addMessageToUI('user', 'Continue to SQL generation', null, false);
+        } else if (currentStep === 'generate_sql') {
+            nextStep = 'execute_sql';
+            addMessageToUI('user', 'Execute the SQL query', null, false);
+        }
+        
+        addMessageToUI('assistant', '🔄 Processing...', null, false);
+        
+        const response = await apiRequest('/api/chat/query', {
+            method: 'POST',
+            body: JSON.stringify({
+                query: currentContext.original_query || 'Continue',
+                session_id: currentSessionId,
+                step: nextStep,
+                context: currentContext
+            })
+        });
+        
+        // Remove processing message
+        const messages = document.querySelectorAll('.message.assistant');
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && lastMessage.textContent.includes('Processing...')) {
+            lastMessage.remove();
+        }
+        
+        handleQueryResponse(response);
+        
+    } catch (error) {
+        console.error('Error continuing to next step:', error);
+        showToast('Error continuing to next step: ' + error.message, 'danger');
+        removeContinueUI();
+    }
+}
+
+function modifyEntities() {
+    // Implement entity modification functionality
+    showToast('Entity modification feature coming soon', 'info');
+}
+
+function modifySQL() {
+    // Implement SQL modification functionality  
+    showToast('SQL modification feature coming soon', 'info');
+}
+
+function startOver() {
+    removeContinueUI();
+    currentStep = null;
+    currentContext = {};
+    const queryInput = document.getElementById('queryInput');
+    queryInput.value = '';
+    queryInput.focus();
+}
+
+
+
+
 </script>
 {% endblock %}
