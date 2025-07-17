@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StructuraAI - Enterprise RAG Platform</title>
+    <meta name="description" content="StructuraAI - Enterprise RAG Platform for Structured Data Querying" />
+    
+    <!-- Preconnect to improve performance -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    
+    <!-- Inter font for modern typography -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    
+    <!-- JetBrains Mono for code -->
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- CSS Variables for theme -->
+    <style>
+      :root {
+        --background: 222.2 84% 4.9%;
+        --foreground: 210 40% 98%;
+        --card: 222.2 84% 4.9%;
+        --card-foreground: 210 40% 98%;
+        --popover: 222.2 84% 4.9%;
+        --popover-foreground: 210 40% 98%;
+        --primary: 210 40% 98%;
+        --primary-foreground: 222.2 84% 4.9%;
+        --secondary: 217.2 32.6% 17.5%;
+        --secondary-foreground: 210 40% 98%;
+        --muted: 217.2 32.6% 17.5%;
+        --muted-foreground: 215 20.2% 65.1%;
+        --accent: 217.2 32.6% 17.5%;
+        --accent-foreground: 210 40% 98%;
+        --destructive: 0 62.8% 30.6%;
+        --destructive-foreground: 210 40% 98%;
+        --border: 217.2 32.6% 17.5%;
+        --input: 217.2 32.6% 17.5%;
+        --ring: 212.7 26.8% 83.9%;
+        --radius: 0.5rem;
+      }
+      
+      [data-theme="light"] {
+        --background: 0 0% 100%;
+        --foreground: 222.2 84% 4.9%;
+        --card: 0 0% 100%;
+        --card-foreground: 222.2 84% 4.9%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 222.2 84% 4.9%;
+        --primary: 222.2 47.4% 11.2%;
+        --primary-foreground: 210 40% 98%;
+        --secondary: 210 40% 96%;
+        --secondary-foreground: 222.2 84% 4.9%;
+        --muted: 210 40% 96%;
+        --muted-foreground: 215.4 16.3% 46.9%;
+        --accent: 210 40% 96%;
+        --accent-foreground: 222.2 84% 4.9%;
+        --destructive: 0 84.2% 60.2%;
+        --destructive-foreground: 210 40% 98%;
+        --border: 214.3 31.8% 91.4%;
+        --input: 214.3 31.8% 91.4%;
+        --ring: 222.2 84% 4.9%;
+      }
+      
+      * {
+        border-color: hsl(var(--border));
+      }
+      
+      body {
+        background-color: hsl(var(--background));
+        color: hsl(var(--foreground));
+        font-family: 'Inter', sans-serif;
+        font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+      }
+      
+      /* Custom scrollbar */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      
+      ::-webkit-scrollbar-track {
+        background: hsl(var(--muted));
+        border-radius: 4px;
+      }
+      
+      ::-webkit-scrollbar-thumb {
+        background: hsl(var(--muted-foreground));
+        border-radius: 4px;
+      }
+      
+      ::-webkit-scrollbar-thumb:hover {
+        background: hsl(var(--accent-foreground));
+      }
+      
+      /* Loading animation */
+      .loading-shimmer {
+        background: linear-gradient(
+          90deg,
+          hsl(var(--muted)) 25%,
+          hsl(var(--accent)) 50%,
+          hsl(var(--muted)) 75%
+        );
+        background-size: 200% 100%;
+        animation: shimmer 2s infinite;
+      }
+      
+      /* Glass morphism effect */
+      .glass {
+        background: rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+      }
+      
+      .glass-dark {
+        background: rgba(0, 0, 0, 0.1);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+      }
+      
+      /* Gradient text */
+      .gradient-text {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      
+      /* Custom focus styles */
+      .focus-visible:focus-visible {
+        outline: 2px solid hsl(var(--ring));
+        outline-offset: 2px;
+      }
+      
+      /* Smooth transitions */
+      * {
+        transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen bg-background font-sans antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

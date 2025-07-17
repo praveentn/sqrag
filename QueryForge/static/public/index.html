@@ -1,0 +1,263 @@
+<!-- static/public/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#3b82f6" />
+    
+    <!-- SEO Meta Tags -->
+    <meta name="description" content="QueryForge Pro - Enterprise RAG Platform for Intelligent Data Querying" />
+    <meta name="keywords" content="RAG, natural language processing, SQL, data querying, enterprise, AI, machine learning" />
+    <meta name="author" content="QueryForge Team" />
+    
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://queryforge.pro/" />
+    <meta property="og:title" content="QueryForge Pro - Enterprise RAG Platform" />
+    <meta property="og:description" content="Transform natural language into powerful SQL queries with our intelligent data platform" />
+    <meta property="og:image" content="/og-image.png" />
+    
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:url" content="https://queryforge.pro/" />
+    <meta property="twitter:title" content="QueryForge Pro - Enterprise RAG Platform" />
+    <meta property="twitter:description" content="Transform natural language into powerful SQL queries with our intelligent data platform" />
+    <meta property="twitter:image" content="/twitter-image.png" />
+    
+    <!-- Apple Touch Icon -->
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    
+    <!-- Preconnect to external domains for performance -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+    
+    <!-- Custom CSS for loading state -->
+    <style>
+        /* Loading screen styles */
+        .loading-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 9999;
+            color: white;
+            font-family: 'Inter', sans-serif;
+        }
+        
+        .loading-logo {
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 24px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .loading-spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top: 3px solid white;
+            animation: spin 1s linear infinite;
+        }
+        
+        .loading-text {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+        
+        .loading-subtitle {
+            font-size: 16px;
+            opacity: 0.8;
+            text-align: center;
+            max-width: 300px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Hide loading screen when React is ready */
+        .app-loaded .loading-screen {
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.5s ease-out;
+        }
+        
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #f1f5f9;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+        
+        /* Dark mode scrollbar */
+        @media (prefers-color-scheme: dark) {
+            ::-webkit-scrollbar-track {
+                background: #1e293b;
+            }
+            
+            ::-webkit-scrollbar-thumb {
+                background: #475569;
+            }
+            
+            ::-webkit-scrollbar-thumb:hover {
+                background: #64748b;
+            }
+        }
+        
+        /* Print styles */
+        @media print {
+            .no-print {
+                display: none !important;
+            }
+        }
+    </style>
+    
+    <title>QueryForge Pro - Enterprise RAG Platform</title>
+</head>
+<body>
+    <!-- No JavaScript fallback -->
+    <noscript>
+        <div style="
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #1f2937;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            font-family: system-ui, sans-serif;
+            text-align: center;
+            padding: 20px;
+        ">
+            <h1 style="font-size: 2rem; margin-bottom: 1rem;">JavaScript Required</h1>
+            <p style="font-size: 1.1rem; opacity: 0.8; max-width: 500px; line-height: 1.5;">
+                QueryForge Pro requires JavaScript to run. Please enable JavaScript in your browser settings and refresh the page.
+            </p>
+            <button onclick="window.location.reload()" style="
+                margin-top: 2rem;
+                padding: 12px 24px;
+                background: #3b82f6;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 1rem;
+                cursor: pointer;
+            ">
+                Refresh Page
+            </button>
+        </div>
+    </noscript>
+    
+    <!-- Loading Screen -->
+    <div class="loading-screen" id="loading-screen">
+        <div class="loading-logo">
+            <div class="loading-spinner"></div>
+        </div>
+        <div class="loading-text">QueryForge Pro</div>
+        <div class="loading-subtitle">
+            Loading your intelligent data platform...
+        </div>
+    </div>
+    
+    <!-- React App Root -->
+    <div id="root"></div>
+    
+    <!-- Service Worker Registration -->
+    <script>
+        // Register service worker for PWA capabilities
+        if ('serviceWorker' in navigator && 'production' === 'production') {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js')
+                    .then((registration) => {
+                        console.log('SW registered: ', registration);
+                    })
+                    .catch((registrationError) => {
+                        console.log('SW registration failed: ', registrationError);
+                    });
+            });
+        }
+        
+        // Remove loading screen when React app is loaded
+        window.addEventListener('DOMContentLoaded', () => {
+            // Set a minimum loading time for better UX
+            setTimeout(() => {
+                const loadingScreen = document.getElementById('loading-screen');
+                if (loadingScreen) {
+                    document.body.classList.add('app-loaded');
+                    setTimeout(() => {
+                        loadingScreen.remove();
+                    }, 500);
+                }
+            }, 1000);
+        });
+        
+        // Error handling
+        window.addEventListener('error', (event) => {
+            console.error('Global error:', event.error);
+            // You could send this to an error tracking service
+        });
+        
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('Unhandled promise rejection:', event.reason);
+            // You could send this to an error tracking service
+        });
+        
+        // Performance monitoring
+        window.addEventListener('load', () => {
+            if ('performance' in window) {
+                const perfData = performance.getEntriesByType('navigation')[0];
+                console.log('Page load time:', perfData.loadEventEnd - perfData.loadEventStart, 'ms');
+            }
+        });
+    </script>
+    
+    <!-- Environment variables for React -->
+    <script>
+        window.ENV = {
+            API_URL: '<%= process.env.REACT_APP_API_URL || "http://localhost:5000/api" %>',
+            VERSION: '<%= process.env.REACT_APP_VERSION || "1.0.0" %>',
+            ENVIRONMENT: '<%= process.env.NODE_ENV || "development" %>'
+        };
+    </script>
+</body>
+</html>
