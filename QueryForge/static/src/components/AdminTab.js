@@ -22,7 +22,7 @@ import {
   // Memory,
   Network,
   Server,
-  Eye
+  Eye, X
 } from 'lucide-react';
 import LoadingSpinner, { LoadingButton, SkeletonLoader } from './LoadingSpinner';
 

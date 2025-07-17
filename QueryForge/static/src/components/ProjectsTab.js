@@ -29,7 +29,7 @@ const ProjectsTab = ({ apiUrl, onNotification, onProjectsChange, onProjectSelect
     fetchProjects();
   }, []);
 
-  const fetchProjects = async () => {
+  const fetchProjects = async (notifyParent = false) => {
     try {
       setLoading(true);
       const response = await fetch(`${apiUrl}/projects`);
@@ -38,7 +38,7 @@ const ProjectsTab = ({ apiUrl, onNotification, onProjectsChange, onProjectSelect
       const data = await response.json();
       setProjects(data.projects || []);
       
-      if (onProjectsChange) {
+      if (notifyParent && onProjectsChange) {
         onProjectsChange();
       }
     } catch (error) {
@@ -63,8 +63,8 @@ const ProjectsTab = ({ apiUrl, onNotification, onProjectsChange, onProjectSelect
       const data = await response.json();
       onNotification(`Project "${data.project.name}" created successfully`, 'success');
       setShowCreateModal(false);
-      fetchProjects();
-    } catch (error) {
+      fetchProjects(true);          // sync parent once    
+      } catch (error) {
       onNotification('Error creating project: ' + error.message, 'error');
     }
   };
@@ -85,7 +85,7 @@ const ProjectsTab = ({ apiUrl, onNotification, onProjectsChange, onProjectSelect
       onNotification(`Project "${data.project.name}" updated successfully`, 'success');
       setShowEditModal(false);
       setSelectedProject(null);
-      fetchProjects();
+      fetchProjects(true);
     } catch (error) {
       onNotification('Error updating project: ' + error.message, 'error');
     }
@@ -104,7 +104,7 @@ const ProjectsTab = ({ apiUrl, onNotification, onProjectsChange, onProjectSelect
       if (!response.ok) throw new Error('Failed to delete project');
       
       onNotification(`Project "${projectName}" deleted successfully`, 'success');
-      fetchProjects();
+      fetchProjects(true);
     } catch (error) {
       onNotification('Error deleting project: ' + error.message, 'error');
     }
@@ -127,7 +127,7 @@ const ProjectsTab = ({ apiUrl, onNotification, onProjectsChange, onProjectSelect
       
       const data = await response.json();
       onNotification(`Project cloned as "${data.project.name}"`, 'success');
-      fetchProjects();
+      fetchProjects(true);
     } catch (error) {
       onNotification('Error cloning project: ' + error.message, 'error');
     }
@@ -511,6 +511,10 @@ const ProjectModal = ({ title, project, onSubmit, onCancel }) => {
       </div>
     </div>
   );
+};
+
+ProjectsTab.defaultProps = {
+  onNotification:    () => {},
 };
 
 export default ProjectsTab;

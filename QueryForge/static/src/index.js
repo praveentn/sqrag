@@ -64,7 +64,7 @@ class ErrorBoundary extends React.Component {
                 <div className="mt-2 p-3 bg-gray-50 rounded text-xs font-mono text-gray-700 overflow-auto max-h-32">
                   {this.state.error && this.state.error.toString()}
                   <br />
-                  {this.state.errorInfo.componentStack}
+                  <pre>{this.state.errorInfo?.componentStack || "no stack trace available"}</pre>
                 </div>
               </details>
             </div>

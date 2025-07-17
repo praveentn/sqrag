@@ -12,6 +12,7 @@ import subprocess
 import time
 import logging
 from pathlib import Path
+from sqlalchemy import text
 
 # Force UTF-8 encoding for Windows compatibility
 if sys.platform.startswith('win'):
@@ -182,7 +183,7 @@ def init_database():
             logger.info("✓ Database tables created successfully")
             
             # Check if we can connect
-            db.session.execute('SELECT 1')
+            db.session.execute(text('SELECT 1'))
             logger.info("✓ Database connection verified")
             
         return True

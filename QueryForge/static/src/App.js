@@ -199,26 +199,55 @@ const App = () => {
     showNotification('Project deleted successfully', 'success');
   };
 
-  // Get current tab component
+  // In App.js, update getCurrentTabComponent to pass the correct props
   const getCurrentTabComponent = () => {
     const currentTab = tabs.find(tab => tab.id === activeTab);
     if (!currentTab) return null;
 
     const Component = currentTab.component;
-    
+
+    // Pass projectId and apiUrl, rename showNotification to onNotification
     const commonProps = {
-      selectedProject,
-      projects,
+      apiUrl: API_BASE_URL,
+      onNotification: showNotification,
+      projectId: selectedProject ? selectedProject.id : null,
       onProjectSelect: handleProjectSelect,
       onProjectCreate: handleProjectCreate,
       onProjectUpdate: handleProjectUpdate,
-      onProjectDelete: handleProjectDelete,
-      showNotification,
-      apiBaseUrl: API_BASE_URL
+      onProjectDelete: handleProjectDelete
     };
 
     return <Component {...commonProps} />;
   };
+
+
+  // // Get current tab component
+  // const getCurrentTabComponent = () => {
+  //   const currentTab = tabs.find(tab => tab.id === activeTab);
+  //   if (!currentTab) return null;
+
+  //   const Component = currentTab.component;
+    
+  //   // const commonProps = {
+  //   //   selectedProject,
+  //   //   projects,
+  //   //   onProjectSelect: handleProjectSelect,
+  //   //   onProjectCreate: handleProjectCreate,
+  //   //   onProjectUpdate: handleProjectUpdate,
+  //   //   onProjectDelete: handleProjectDelete,
+  //   //   showNotification,
+  //   //   apiBaseUrl: API_BASE_URL
+  //   // };
+
+  //   const commonProps = {
+  //     apiUrl: API_BASE_URL,             // match ProjectsTab’s apiUrl prop
+  //     onNotification: showNotification, // match ProjectsTab’s onNotification prop
+  //     onProjectsChange: loadProjects,   // so parent refreshes its project list
+  //     onProjectSelect: handleProjectSelect
+  //   };
+
+  //   return <Component {...commonProps} />;
+  // };
 
   if (loading) {
     return (
