@@ -1,348 +1,310 @@
 # services/admin_service.py
 import os
-import time
 import logging
-import psutil
+import psutil  # FIXED: Use psutil instead of Memory for system monitoring
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
-from sqlalchemy import text, inspect, create_engine
-import sqlite3
+from sqlalchemy import text, inspect
 import json
 
-from models import (
-    db, Project, DataSource, Table, Column, DictionaryEntry, 
-    Embedding, Index, SearchLog, NLQFeedback
-)
+from models import db, Project, DataSource, Table, Column, DictionaryEntry, Embedding, Index, SearchLog, NLQFeedback
 
 logger = logging.getLogger(__name__)
 
 class AdminService:
-    """Service for admin operations and system monitoring"""
+    """Service for system administration and monitoring"""
     
     def __init__(self):
-        self.allowed_sql_keywords = {
-            'SELECT', 'FROM', 'WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 
-            'OUTER', 'ON', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'OFFSET',
-            'HAVING', 'DISTINCT', 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX',
-            'AS', 'AND', 'OR', 'NOT', 'IN', 'LIKE', 'BETWEEN', 'IS', 'NULL'
-        }
+        self.logger = logger
     
-    def get_system_health(self) -> Dict[str, Any]:
-        """Get comprehensive system health status"""
+    def get_system_stats(self) -> Dict[str, Any]:
+        """Get comprehensive system statistics"""
         try:
-            health = {
-                'overall_status': 'healthy',
-                'timestamp': datetime.utcnow().isoformat(),
-                'database': self._get_database_health(),
-                'services': self._get_service_health(),
-                'system': self._get_system_metrics(),
-                'application': self._get_application_metrics()
+            stats = {
+                'database': self._get_database_stats(),
+                'system': self._get_system_stats(),
+                'projects': self._get_project_stats(),
+                'usage': self._get_usage_stats(),
+                'health': self._get_health_status()
             }
             
-            # Determine overall status
-            if any(s.get('status') == 'error' for s in health['services'].values()):
-                health['overall_status'] = 'error'
-            elif any(s.get('status') == 'warning' for s in health['services'].values()):
-                health['overall_status'] = 'warning'
-            
-            return health
+            return {
+                'success': True,
+                'stats': stats,
+                'timestamp': datetime.utcnow().isoformat()
+            }
             
         except Exception as e:
-            logger.error(f"Error getting system health: {str(e)}")
+            logger.error(f"Error getting system stats: {str(e)}")
             return {
-                'overall_status': 'error',
+                'success': False,
                 'error': str(e),
                 'timestamp': datetime.utcnow().isoformat()
             }
     
-    def _get_database_health(self) -> Dict[str, Any]:
-        """Get database health and statistics"""
+    def _get_database_stats(self) -> Dict[str, Any]:
+        """Get database statistics"""
         try:
-            # Test connection
-            start_time = time.time()
-            db.session.execute(text("SELECT 1"))
-            connection_time = time.time() - start_time
+            stats = {}
             
-            # Get record counts
-            records = {}
-            try:
-                records['projects'] = Project.query.count()
-                records['data_sources'] = DataSource.query.count()
-                records['tables'] = Table.query.count()
-                records['columns'] = Column.query.count()
-                records['dictionary_entries'] = DictionaryEntry.query.count()
-                records['embeddings'] = Embedding.query.count()
-                records['indexes'] = Index.query.count()
-                records['search_logs'] = SearchLog.query.count()
-            except Exception as e:
-                logger.warning(f"Error getting record counts: {str(e)}")
-                records = {'error': 'Could not fetch record counts'}
+            # Count records in each table
+            stats['record_counts'] = {
+                'projects': Project.query.count(),
+                'data_sources': DataSource.query.count(),
+                'tables': Table.query.count(),
+                'columns': Column.query.count(),
+                'dictionary_entries': DictionaryEntry.query.count(),
+                'embeddings': Embedding.query.count(),
+                'indexes': Index.query.count(),
+                'search_logs': SearchLog.query.count(),
+                'nlq_feedback': NLQFeedback.query.count()
+            }
             
-            # Get database size
-            db_size_mb = 0
+            # Calculate total records
+            stats['total_records'] = sum(stats['record_counts'].values())
+            
+            # Get database file size (for SQLite)
             try:
-                if 'sqlite' in str(db.engine.url):
-                    # For SQLite
-                    db_path = str(db.engine.url).replace('sqlite:///', '')
-                    if os.path.exists(db_path):
-                        db_size_mb = round(os.path.getsize(db_path) / (1024 * 1024), 2)
+                db_path = 'queryforge.db'  # Default SQLite path
+                if os.path.exists(db_path):
+                    stats['database_size_mb'] = round(os.path.getsize(db_path) / (1024 * 1024), 2)
                 else:
-                    # For PostgreSQL/MySQL
-                    result = db.session.execute(text(
-                        "SELECT pg_size_pretty(pg_database_size(current_database()))"
-                    ))
-                    db_size_mb = result.scalar()
+                    stats['database_size_mb'] = 0
             except:
-                pass
+                stats['database_size_mb'] = 0
             
-            return {
-                'status': 'healthy',
-                'records': records,
-                'total_records': sum(v for v in records.values() if isinstance(v, int)),
-                'size_mb': db_size_mb,
-                'connection_status': 'connected',
-                'connection_time_ms': round(connection_time * 1000, 2)
-            }
+            # Get database engine info
+            stats['database_type'] = str(db.engine.url).split('://')[0]
+            
+            return stats
             
         except Exception as e:
-            logger.error(f"Error getting database health: {str(e)}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'connection_status': 'disconnected'
-            }
+            logger.error(f"Error getting database stats: {str(e)}")
+            return {'error': str(e)}
     
-    def _get_service_health(self) -> Dict[str, Any]:
-        """Get health status of various services"""
-        services = {}
-        
-        # Database service
+    def _get_system_stats(self) -> Dict[str, Any]:
+        """Get system resource statistics"""
         try:
-            db.session.execute(text("SELECT 1"))
-            services['database'] = {
-                'status': 'healthy',
-                'message': 'Database connection active'
+            # Use psutil for system monitoring - FIXED: No more Memory import error
+            stats = {
+                'cpu_percent': psutil.cpu_percent(interval=1),
+                'memory': {
+                    'total_gb': round(psutil.virtual_memory().total / (1024**3), 2),
+                    'available_gb': round(psutil.virtual_memory().available / (1024**3), 2),
+                    'used_percent': psutil.virtual_memory().percent
+                },
+                'disk': {
+                    'total_gb': round(psutil.disk_usage('/').total / (1024**3), 2),
+                    'free_gb': round(psutil.disk_usage('/').free / (1024**3), 2),
+                    'used_percent': psutil.disk_usage('/').percent
+                },
+                'uptime_hours': round((datetime.now() - datetime.fromtimestamp(psutil.boot_time())).total_seconds() / 3600, 1)
             }
-        except Exception as e:
-            services['database'] = {
-                'status': 'error',
-                'message': f'Database error: {str(e)}'
-            }
-        
-        # File system service
-        try:
-            upload_dir = 'uploads'
-            if os.path.exists(upload_dir) and os.access(upload_dir, os.W_OK):
-                services['file_system'] = {
-                    'status': 'healthy',
-                    'message': 'Upload directory accessible'
-                }
-            else:
-                services['file_system'] = {
-                    'status': 'warning',
-                    'message': 'Upload directory not accessible'
-                }
-        except Exception as e:
-            services['file_system'] = {
-                'status': 'error',
-                'message': f'File system error: {str(e)}'
-            }
-        
-        # Index directory service
-        try:
-            index_dir = 'indexes'
-            if os.path.exists(index_dir) and os.access(index_dir, os.W_OK):
-                services['index_storage'] = {
-                    'status': 'healthy',
-                    'message': 'Index directory accessible'
-                }
-            else:
-                services['index_storage'] = {
-                    'status': 'warning',
-                    'message': 'Index directory not accessible'
-                }
-        except Exception as e:
-            services['index_storage'] = {
-                'status': 'error',
-                'message': f'Index storage error: {str(e)}'
-            }
-        
-        # Embedding service (basic check)
-        try:
-            # Check if we can import required packages
-            import sentence_transformers
-            services['embedding_service'] = {
-                'status': 'healthy',
-                'message': 'Embedding dependencies available'
-            }
-        except ImportError:
-            services['embedding_service'] = {
-                'status': 'warning',
-                'message': 'Embedding dependencies not available'
-            }
-        except Exception as e:
-            services['embedding_service'] = {
-                'status': 'error',
-                'message': f'Embedding service error: {str(e)}'
-            }
-        
-        return services
-    
-    def _get_system_metrics(self) -> Dict[str, Any]:
-        """Get system-level metrics"""
-        try:
-            # CPU and Memory
-            cpu_percent = psutil.cpu_percent(interval=1)
-            memory = psutil.virtual_memory()
-            disk = psutil.disk_usage('/')
             
-            return {
-                'cpu_percent': round(cpu_percent, 1),
-                'memory_percent': round(memory.percent, 1),
-                'memory_used_gb': round(memory.used / (1024**3), 2),
-                'memory_total_gb': round(memory.total / (1024**3), 2),
-                'disk_percent': round(disk.percent, 1),
-                'disk_used_gb': round(disk.used / (1024**3), 2),
-                'disk_total_gb': round(disk.total / (1024**3), 2)
-            }
+            return stats
+            
         except Exception as e:
-            logger.warning(f"Error getting system metrics: {str(e)}")
+            logger.error(f"Error getting system stats: {str(e)}")
             return {
-                'error': 'System metrics unavailable'
+                'cpu_percent': 0,
+                'memory': {'total_gb': 0, 'available_gb': 0, 'used_percent': 0},
+                'disk': {'total_gb': 0, 'free_gb': 0, 'used_percent': 0},
+                'uptime_hours': 0,
+                'error': str(e)
             }
     
-    def _get_application_metrics(self) -> Dict[str, Any]:
-        """Get application-specific metrics"""
+    def _get_project_stats(self) -> Dict[str, Any]:
+        """Get project-level statistics"""
         try:
-            # Recent activity (last 24 hours)
-            yesterday = datetime.utcnow() - timedelta(days=1)
+            projects = Project.query.all()
+            
+            stats = {
+                'total_projects': len(projects),
+                'active_projects': len([p for p in projects if p.status == 'active']),
+                'projects_by_status': {},
+                'top_projects': []
+            }
+            
+            # Count by status
+            for project in projects:
+                status = project.status or 'unknown'
+                stats['projects_by_status'][status] = stats['projects_by_status'].get(status, 0) + 1
+            
+            # Get top projects by data volume
+            for project in projects:
+                sources_count = len(project.sources)
+                entries_count = len(project.dictionary_entries)
+                total_items = sources_count + entries_count
+                
+                stats['top_projects'].append({
+                    'id': project.id,
+                    'name': project.name,
+                    'sources_count': sources_count,
+                    'dictionary_entries_count': entries_count,
+                    'total_items': total_items,
+                    'created_at': project.created_at.isoformat() if project.created_at else None
+                })
+            
+            # Sort by total items
+            stats['top_projects'].sort(key=lambda x: x['total_items'], reverse=True)
+            stats['top_projects'] = stats['top_projects'][:10]  # Top 10
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting project stats: {str(e)}")
+            return {'error': str(e)}
+    
+    def _get_usage_stats(self) -> Dict[str, Any]:
+        """Get usage statistics"""
+        try:
+            # Search activity (last 30 days)
+            thirty_days_ago = datetime.utcnow() - timedelta(days=30)
             
             recent_searches = SearchLog.query.filter(
-                SearchLog.timestamp >= yesterday
-            ).count()
+                SearchLog.created_at >= thirty_days_ago
+            ).all()
             
-            # Embedding statistics
-            total_embeddings = Embedding.query.count()
-            embedding_models = db.session.query(Embedding.model_name).distinct().count()
-            
-            # Index statistics
-            ready_indexes = Index.query.filter_by(status='ready').count()
-            total_indexes = Index.query.count()
-            
-            # Project statistics
-            active_projects = Project.query.filter_by(status='active').count()
-            
-            return {
-                'embeddings_count': total_embeddings,
-                'embedding_models_count': embedding_models,
-                'indexes_count': ready_indexes,
-                'total_indexes': total_indexes,
-                'active_projects': active_projects,
-                'activity_24h': {
-                    'searches': recent_searches
+            stats = {
+                'search_activity': {
+                    'total_searches_30d': len(recent_searches),
+                    'avg_search_time_ms': round(sum(s.search_time_ms or 0 for s in recent_searches) / len(recent_searches), 2) if recent_searches else 0,
+                    'most_searched_projects': self._get_most_searched_projects(recent_searches)
+                },
+                'data_ingestion': {
+                    'total_sources': DataSource.query.count(),
+                    'successful_ingests': DataSource.query.filter_by(ingest_status='completed').count(),
+                    'failed_ingests': DataSource.query.filter_by(ingest_status='failed').count(),
+                    'pending_ingests': DataSource.query.filter_by(ingest_status='pending').count()
+                },
+                'embeddings': {
+                    'total_embeddings': Embedding.query.count(),
+                    'total_indexes': Index.query.count(),
+                    'ready_indexes': Index.query.filter_by(status='ready').count()
                 }
             }
+            
+            return stats
+            
         except Exception as e:
-            logger.warning(f"Error getting application metrics: {str(e)}")
+            logger.error(f"Error getting usage stats: {str(e)}")
+            return {'error': str(e)}
+    
+    def _get_most_searched_projects(self, search_logs: List[SearchLog]) -> List[Dict]:
+        """Get most searched projects from search logs"""
+        try:
+            project_counts = {}
+            for log in search_logs:
+                project_counts[log.project_id] = project_counts.get(log.project_id, 0) + 1
+            
+            # Get project names
+            result = []
+            for project_id, count in sorted(project_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+                project = Project.query.get(project_id)
+                if project:
+                    result.append({
+                        'project_id': project_id,
+                        'project_name': project.name,
+                        'search_count': count
+                    })
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting most searched projects: {str(e)}")
+            return []
+    
+    def _get_health_status(self) -> Dict[str, Any]:
+        """Get system health status"""
+        try:
+            health = {
+                'overall_status': 'healthy',
+                'checks': {}
+            }
+            
+            # Database connectivity
+            try:
+                db.session.execute(text('SELECT 1'))
+                health['checks']['database'] = {'status': 'healthy', 'message': 'Database connection OK'}
+            except Exception as e:
+                health['checks']['database'] = {'status': 'unhealthy', 'message': f'Database error: {str(e)}'}
+                health['overall_status'] = 'unhealthy'
+            
+            # File system space
+            try:
+                disk_usage = psutil.disk_usage('/')
+                free_percent = (disk_usage.free / disk_usage.total) * 100
+                if free_percent < 10:
+                    health['checks']['disk_space'] = {'status': 'warning', 'message': f'Low disk space: {free_percent:.1f}% free'}
+                    if health['overall_status'] == 'healthy':
+                        health['overall_status'] = 'warning'
+                else:
+                    health['checks']['disk_space'] = {'status': 'healthy', 'message': f'Disk space OK: {free_percent:.1f}% free'}
+            except Exception as e:
+                health['checks']['disk_space'] = {'status': 'unknown', 'message': f'Cannot check disk space: {str(e)}'}
+            
+            # Memory usage
+            try:
+                memory = psutil.virtual_memory()
+                if memory.percent > 90:
+                    health['checks']['memory'] = {'status': 'warning', 'message': f'High memory usage: {memory.percent:.1f}%'}
+                    if health['overall_status'] == 'healthy':
+                        health['overall_status'] = 'warning'
+                else:
+                    health['checks']['memory'] = {'status': 'healthy', 'message': f'Memory usage OK: {memory.percent:.1f}%'}
+            except Exception as e:
+                health['checks']['memory'] = {'status': 'unknown', 'message': f'Cannot check memory: {str(e)}'}
+            
+            return health
+            
+        except Exception as e:
+            logger.error(f"Error getting health status: {str(e)}")
             return {
-                'error': 'Application metrics unavailable'
+                'overall_status': 'unknown',
+                'checks': {},
+                'error': str(e)
             }
     
-    def execute_sql_query(self, sql: str) -> Dict[str, Any]:
-        """Execute SQL query with safety checks"""
+    def execute_query(self, query: str) -> Dict[str, Any]:
+        """Execute SQL query (admin only)"""
         try:
-            # Security validation
-            if not self._is_safe_sql(sql):
+            # Security check - only allow SELECT statements for safety
+            query_upper = query.strip().upper()
+            if not query_upper.startswith('SELECT'):
                 return {
                     'success': False,
-                    'error': 'Only SELECT statements are allowed',
-                    'data': [],
-                    'columns': [],
-                    'row_count': 0
+                    'error': 'Only SELECT queries are allowed for security reasons'
                 }
             
-            start_time = time.time()
-            
             # Execute query
-            result = db.session.execute(text(sql))
+            result = db.session.execute(text(query))
+            rows = result.fetchall()
             
-            # Get columns and data
-            columns = list(result.keys()) if result.keys() else []
-            data = []
-            
-            for row in result:
-                row_dict = {}
-                for i, column in enumerate(columns):
-                    value = row[i]
-                    # Convert datetime objects to strings
-                    if isinstance(value, datetime):
-                        value = value.isoformat()
-                    # Round decimal values
-                    elif isinstance(value, (float, int)) and isinstance(value, float):
-                        value = round(value, 3)
-                    row_dict[column] = value
-                data.append(row_dict)
-            
-            execution_time = time.time() - start_time
+            # Convert to list of dictionaries
+            if rows:
+                columns = list(result.keys())
+                data = [dict(zip(columns, row)) for row in rows]
+            else:
+                columns = []
+                data = []
             
             return {
                 'success': True,
-                'data': data,
                 'columns': columns,
+                'data': data,
                 'row_count': len(data),
-                'execution_time_ms': round(execution_time * 1000, 2),
-                'sql': sql
+                'execution_time': 'N/A'
             }
             
         except Exception as e:
-            logger.error(f"Error executing SQL query: {str(e)}")
+            logger.error(f"Error executing query: {str(e)}")
             return {
                 'success': False,
-                'error': str(e),
-                'data': [],
-                'columns': [],
-                'row_count': 0,
-                'sql': sql
+                'error': str(e)
             }
     
-    def _is_safe_sql(self, sql: str) -> bool:
-        """Check if SQL query is safe to execute"""
-        sql_upper = sql.strip().upper()
-        
-        # Must start with SELECT
-        if not sql_upper.startswith('SELECT'):
-            return False
-        
-        # Check for dangerous keywords
-        dangerous_keywords = {
-            'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 
-            'TRUNCATE', 'REPLACE', 'MERGE', 'EXEC', 'EXECUTE',
-            'GRANT', 'REVOKE', 'COMMIT', 'ROLLBACK'
-        }
-        
-        # Split by whitespace and check each word
-        words = sql_upper.split()
-        for word in words:
-            clean_word = word.strip('(),;')
-            if clean_word in dangerous_keywords:
-                return False
-        
-        # Check for SQL injection patterns
-        injection_patterns = [
-            '--', '/*', '*/', 'xp_', 'sp_cmdshell', 'exec(',
-            'execute(', 'eval(', 'union select', '; drop',
-            '; delete', '; insert', '; update'
-        ]
-        
-        sql_lower = sql.lower()
-        for pattern in injection_patterns:
-            if pattern in sql_lower:
-                return False
-        
-        return True
-    
     def get_table_details(self, table_id: int) -> Dict[str, Any]:
-        """Get detailed information about a specific table"""
+        """Get detailed information about a table"""
         try:
             table = Table.query.get(table_id)
             if not table:
@@ -351,27 +313,36 @@ class AdminService:
                     'error': f'Table {table_id} not found'
                 }
             
-            # Get column details
-            columns = []
-            for col in table.columns:
-                col_data = col.to_dict()
-                columns.append(col_data)
+            # Get columns
+            columns = Column.query.filter_by(table_id=table_id).all()
             
-            # Get sample data (first 10 rows)
-            try:
-                from services.data_source_service import DataSourceService
-                data_service = DataSourceService()
-                sample_data = data_service.get_table_sample_data(table_id, limit=10)
-            except Exception as e:
-                logger.warning(f"Could not get sample data: {str(e)}")
-                sample_data = {'columns': [], 'data': [], 'total_rows': 0}
+            # Get related embeddings
+            embeddings = Embedding.query.filter_by(
+                object_type='table',
+                object_id=table_id
+            ).all()
+            
+            column_embeddings = Embedding.query.filter_by(
+                object_type='column'
+            ).filter(
+                Embedding.object_id.in_([c.id for c in columns])
+            ).all()
             
             return {
                 'success': True,
                 'table': table.to_dict(),
-                'columns': columns,
-                'sample_data': sample_data,
-                'source': table.source.to_dict() if table.source else None
+                'columns': [col.to_dict() for col in columns],
+                'embeddings': {
+                    'table_embeddings': len(embeddings),
+                    'column_embeddings': len(column_embeddings),
+                    'total_embeddings': len(embeddings) + len(column_embeddings)
+                },
+                'statistics': {
+                    'column_count': len(columns),
+                    'pii_columns': len([c for c in columns if c.pii_flag]),
+                    'nullable_columns': len([c for c in columns if c.is_nullable]),
+                    'primary_key_columns': len([c for c in columns if c.is_primary_key])
+                }
             }
             
         except Exception as e:
@@ -384,51 +355,61 @@ class AdminService:
     def get_database_schema(self) -> Dict[str, Any]:
         """Get complete database schema information"""
         try:
+            # Get all tables with their relationships
+            projects = Project.query.all()
+            
             schema = {
-                'tables': [],
-                'relationships': [],
-                'statistics': {}
+                'projects': [],
+                'summary': {
+                    'total_projects': len(projects),
+                    'total_sources': 0,
+                    'total_tables': 0,
+                    'total_columns': 0
+                }
             }
             
-            # Get all tables
-            tables = Table.query.all()
-            for table in tables:
-                table_info = {
-                    'id': table.id,
-                    'name': table.name,
-                    'display_name': table.display_name,
-                    'row_count': table.row_count,
-                    'column_count': table.column_count,
-                    'source': {
-                        'id': table.source.id,
-                        'name': table.source.name,
-                        'type': table.source.type,
-                        'project_name': table.source.project.name
-                    } if table.source else None,
-                    'columns': []
+            for project in projects:
+                project_data = {
+                    'id': project.id,
+                    'name': project.name,
+                    'sources': []
                 }
                 
-                # Get column information
-                for col in table.columns:
-                    col_info = {
-                        'name': col.name,
-                        'data_type': col.data_type,
-                        'is_nullable': col.is_nullable,
-                        'is_primary_key': col.is_primary_key,
-                        'is_foreign_key': col.is_foreign_key,
-                        'business_category': col.business_category
+                for source in project.sources:
+                    source_data = {
+                        'id': source.id,
+                        'name': source.name,
+                        'type': source.type,
+                        'status': source.ingest_status,
+                        'tables': []
                     }
-                    table_info['columns'].append(col_info)
+                    
+                    for table in source.tables:
+                        table_data = {
+                            'id': table.id,
+                            'name': table.name,
+                            'row_count': table.row_count,
+                            'column_count': table.column_count,
+                            'columns': [
+                                {
+                                    'id': col.id,
+                                    'name': col.name,
+                                    'data_type': col.data_type,
+                                    'is_nullable': col.is_nullable,
+                                    'is_primary_key': col.is_primary_key,
+                                    'pii_flag': col.pii_flag
+                                }
+                                for col in table.columns
+                            ]
+                        }
+                        source_data['tables'].append(table_data)
+                        schema['summary']['total_columns'] += len(table.columns)
+                    
+                    project_data['sources'].append(source_data)
+                    schema['summary']['total_tables'] += len(source.tables)
                 
-                schema['tables'].append(table_info)
-            
-            # Get basic statistics
-            schema['statistics'] = {
-                'total_tables': len(tables),
-                'total_columns': Column.query.count(),
-                'total_projects': Project.query.count(),
-                'total_sources': DataSource.query.count()
-            }
+                schema['projects'].append(project_data)
+                schema['summary']['total_sources'] += len(project.sources)
             
             return {
                 'success': True,
@@ -443,59 +424,74 @@ class AdminService:
             }
     
     def cleanup_orphaned_data(self) -> Dict[str, Any]:
-        """Clean up orphaned data and fix inconsistencies"""
+        """Clean up orphaned data and inconsistencies"""
         try:
-            cleanup_results = {
-                'embeddings_cleaned': 0,
-                'indexes_cleaned': 0,
-                'search_logs_cleaned': 0,
-                'files_cleaned': []
+            cleanup_stats = {
+                'orphaned_embeddings': 0,
+                'orphaned_indexes': 0,
+                'invalid_search_logs': 0,
+                'total_cleaned': 0
             }
             
-            # Clean up embeddings for non-existent objects
-            orphaned_embeddings = 0
+            # Find orphaned embeddings (embeddings with no corresponding objects)
+            orphaned_embeddings = []
+            
             embeddings = Embedding.query.all()
-            for emb in embeddings:
+            for embedding in embeddings:
                 object_exists = False
                 
-                if emb.object_type == 'table':
-                    object_exists = Table.query.get(emb.object_id) is not None
-                elif emb.object_type == 'column':
-                    object_exists = Column.query.get(emb.object_id) is not None
-                elif emb.object_type == 'dictionary_entry':
-                    object_exists = DictionaryEntry.query.get(emb.object_id) is not None
+                if embedding.object_type == 'table':
+                    object_exists = Table.query.get(embedding.object_id) is not None
+                elif embedding.object_type == 'column':
+                    object_exists = Column.query.get(embedding.object_id) is not None
+                elif embedding.object_type == 'dictionary_entry':
+                    object_exists = DictionaryEntry.query.get(embedding.object_id) is not None
                 
                 if not object_exists:
-                    db.session.delete(emb)
-                    orphaned_embeddings += 1
+                    orphaned_embeddings.append(embedding)
             
-            cleanup_results['embeddings_cleaned'] = orphaned_embeddings
+            # Delete orphaned embeddings
+            for embedding in orphaned_embeddings:
+                db.session.delete(embedding)
+                cleanup_stats['orphaned_embeddings'] += 1
             
-            # Clean up old search logs (older than 90 days)
-            cutoff_date = datetime.utcnow() - timedelta(days=90)
-            old_logs = SearchLog.query.filter(SearchLog.timestamp < cutoff_date).count()
-            SearchLog.query.filter(SearchLog.timestamp < cutoff_date).delete()
-            cleanup_results['search_logs_cleaned'] = old_logs
+            # Find orphaned indexes (indexes for non-existent projects)
+            orphaned_indexes = []
+            indexes = Index.query.all()
+            for index in indexes:
+                if not Project.query.get(index.project_id):
+                    orphaned_indexes.append(index)
             
-            # Clean up orphaned index files
-            index_dir = 'indexes'
-            if os.path.exists(index_dir):
-                valid_index_ids = {str(idx.id) for idx in Index.query.all()}
-                for item in os.listdir(index_dir):
-                    item_path = os.path.join(index_dir, item)
-                    if os.path.isdir(item_path) and item not in valid_index_ids:
-                        try:
-                            import shutil
-                            shutil.rmtree(item_path)
-                            cleanup_results['files_cleaned'].append(item_path)
-                        except Exception as e:
-                            logger.warning(f"Could not clean up {item_path}: {str(e)}")
+            # Delete orphaned indexes
+            for index in orphaned_indexes:
+                db.session.delete(index)
+                cleanup_stats['orphaned_indexes'] += 1
             
+            # Find invalid search logs (logs for non-existent projects)
+            invalid_logs = []
+            search_logs = SearchLog.query.all()
+            for log in search_logs:
+                if not Project.query.get(log.project_id):
+                    invalid_logs.append(log)
+            
+            # Delete invalid search logs
+            for log in invalid_logs:
+                db.session.delete(log)
+                cleanup_stats['invalid_search_logs'] += 1
+            
+            # Commit all changes
             db.session.commit()
+            
+            cleanup_stats['total_cleaned'] = (
+                cleanup_stats['orphaned_embeddings'] + 
+                cleanup_stats['orphaned_indexes'] + 
+                cleanup_stats['invalid_search_logs']
+            )
             
             return {
                 'success': True,
-                'cleanup_results': cleanup_results
+                'cleanup_stats': cleanup_stats,
+                'message': f"Cleaned up {cleanup_stats['total_cleaned']} orphaned records"
             }
             
         except Exception as e:
@@ -506,28 +502,51 @@ class AdminService:
                 'error': str(e)
             }
     
-    def get_query_suggestions(self, table_name: str = None) -> List[str]:
-        """Get suggested SQL queries for exploration"""
-        suggestions = [
-            "SELECT COUNT(*) as total_records FROM projects;",
-            "SELECT type, COUNT(*) as count FROM sources GROUP BY type;",
-            "SELECT name, row_count, column_count FROM tables ORDER BY row_count DESC LIMIT 10;",
-            "SELECT model_name, COUNT(*) as embedding_count FROM embeddings GROUP BY model_name;",
-            "SELECT status, COUNT(*) as count FROM indexes GROUP BY status;",
-            "SELECT p.name as project, COUNT(t.id) as table_count FROM projects p LEFT JOIN sources s ON p.id = s.project_id LEFT JOIN tables t ON s.id = t.source_id GROUP BY p.id, p.name;",
-            "SELECT data_type, COUNT(*) as column_count FROM columns GROUP BY data_type ORDER BY column_count DESC;",
-            "SELECT category, COUNT(*) as term_count FROM dictionary GROUP BY category;",
-            "SELECT DATE(created_at) as date, COUNT(*) as searches FROM search_logs WHERE created_at >= DATE('now', '-7 days') GROUP BY DATE(created_at);",
-            "SELECT t.name as table_name, COUNT(c.id) as column_count FROM tables t LEFT JOIN columns c ON t.id = c.table_id GROUP BY t.id, t.name ORDER BY column_count DESC;"
-        ]
-        
-        if table_name:
-            # Add table-specific suggestions
-            table_suggestions = [
-                f"SELECT * FROM {table_name} LIMIT 10;",
-                f"SELECT COUNT(*) FROM {table_name};",
-                f"SELECT * FROM {table_name} WHERE id IS NOT NULL LIMIT 5;",
-            ]
-            suggestions.extend(table_suggestions)
-        
-        return suggestions
+    def export_project_data(self, project_id: int) -> Dict[str, Any]:
+        """Export project data for backup"""
+        try:
+            project = Project.query.get(project_id)
+            if not project:
+                return {
+                    'success': False,
+                    'error': f'Project {project_id} not found'
+                }
+            
+            # Export all project data
+            export_data = {
+                'project': project.to_dict(),
+                'sources': [source.to_dict() for source in project.sources],
+                'tables': [],
+                'columns': [],
+                'dictionary_entries': [entry.to_dict() for entry in project.dictionary_entries],
+                'embeddings_count': len(project.embeddings),
+                'indexes': [index.to_dict() for index in project.indexes],
+                'export_timestamp': datetime.utcnow().isoformat()
+            }
+            
+            # Get tables and columns
+            for source in project.sources:
+                for table in source.tables:
+                    export_data['tables'].append(table.to_dict())
+                    for column in table.columns:
+                        export_data['columns'].append(column.to_dict())
+            
+            return {
+                'success': True,
+                'export_data': export_data,
+                'summary': {
+                    'sources': len(export_data['sources']),
+                    'tables': len(export_data['tables']),
+                    'columns': len(export_data['columns']),
+                    'dictionary_entries': len(export_data['dictionary_entries']),
+                    'embeddings': export_data['embeddings_count'],
+                    'indexes': len(export_data['indexes'])
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error exporting project data: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e)
+            }

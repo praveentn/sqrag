@@ -1,16 +1,17 @@
 # services/data_source_service.py
 import os
 import pandas as pd
-import sqlalchemy
-from sqlalchemy import create_engine, text, inspect
-import json
-import logging
-import re
-from typing import Dict, List, Any, Optional
-import traceback
 import numpy as np
+import json
+import re
+import logging
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
+from werkzeug.utils import secure_filename
 
-from models import db, DataSource, Table, Column
+from models import db, Project, DataSource, Table, Column
+from sqlalchemy import create_engine, text, inspect
+from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -18,105 +19,160 @@ class DataSourceService:
     """Service for handling data source operations"""
     
     def __init__(self):
-        self.supported_file_types = {
-            'csv': self._process_csv,
-            'xlsx': self._process_excel,
-            'xls': self._process_excel,
-            'json': self._process_json
-        }
+        self.logger = logger
+        self.upload_folder = Config.UPLOAD_FOLDER
+        self.allowed_extensions = Config.ALLOWED_EXTENSIONS
+        
+        # Ensure upload directory exists
+        os.makedirs(self.upload_folder, exist_ok=True)
     
-    def process_uploaded_file(self, source_id: int, file_path: str) -> int:
-        """Process uploaded file and create tables"""
+    def process_uploaded_file(self, file, project_id: int) -> Dict[str, Any]:
+        """Process an uploaded file and create data source"""
         try:
-            source = DataSource.query.get(source_id)
-            if not source:
-                raise ValueError(f"Data source {source_id} not found")
+            # Validate file
+            if not self._allowed_file(file.filename):
+                return {
+                    'success': False,
+                    'error': f'File type not allowed. Allowed: {", ".join(self.allowed_extensions)}'
+                }
             
-            file_extension = source.subtype.lower()
+            # Save file
+            filename = secure_filename(file.filename)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{timestamp}_{filename}"
+            file_path = os.path.join(self.upload_folder, filename)
+            file.save(file_path)
             
-            if file_extension not in self.supported_file_types:
+            # Get file info
+            file_size = os.path.getsize(file_path)
+            file_extension = filename.split('.')[-1].lower()
+            
+            # Create data source record
+            source = DataSource(
+                project_id=project_id,
+                name=file.filename,  # Original filename
+                type='file',
+                subtype=file_extension,
+                connection_string=file_path,
+                file_size_bytes=file_size,
+                ingest_status='processing'
+            )
+            db.session.add(source)
+            db.session.flush()  # Get ID
+            
+            # Process the file based on type
+            if file_extension in ['csv', 'txt']:
+                tables_created = self._process_csv_file(source, file_path)
+            elif file_extension in ['xlsx', 'xls']:
+                tables_created = self._process_excel_file(source, file_path)
+            elif file_extension == 'json':
+                tables_created = self._process_json_file(source, file_path)
+            else:
                 raise ValueError(f"Unsupported file type: {file_extension}")
             
-            logger.info(f"Processing {file_extension} file: {file_path}")
+            # Update source status
+            source.ingest_status = 'completed'
+            db.session.commit()
             
-            # Process based on file type
-            processor = self.supported_file_types[file_extension]
-            tables_created = processor(source, file_path)
+            # Get table info for response
+            table = Table.query.filter_by(source_id=source.id).first()
+            columns_created = Column.query.filter_by(table_id=table.id).count() if table else 0
             
-            logger.info(f"Successfully processed file {file_path}, created {tables_created} tables")
-            return tables_created
+            # Generate preview data
+            preview_data = self._generate_preview(file_path, file_extension)
+            
+            return {
+                'success': True,
+                'source': {
+                    'id': source.id,
+                    'name': source.name,
+                    'type': source.type,
+                    'ingest_status': source.ingest_status
+                },
+                'processing': {
+                    'tables_created': tables_created,
+                    'columns_created': columns_created
+                },
+                'table': {
+                    'id': table.id,
+                    'name': table.name,
+                    'row_count': table.row_count,
+                    'column_count': table.column_count
+                },
+                'preview': preview_data,
+                'file_info': {
+                    'size_bytes': os.path.getsize(file_path),
+                    'size_mb': round(os.path.getsize(file_path) / (1024*1024), 2),
+                    'extension': file_extension,
+                    'shape': f"{len(preview_data)} rows × {len(preview_data[0]) if preview_data else 0} columns" if preview_data else "Unknown"
+                }
+            }
             
         except Exception as e:
-            logger.error(f"Error processing file {file_path}: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise
+            db.session.rollback()
+            self.logger.error(f"Error processing file {file.filename}: {str(e)}")
+            
+            # Update source status to failed if it exists
+            try:
+                if 'source' in locals():
+                    source.ingest_status = 'failed'
+                    db.session.commit()
+            except:
+                pass
+            
+            return {
+                'success': False,
+                'error': f'Error processing file: {str(e)}'
+            }
     
-    def _process_csv(self, source: DataSource, file_path: str) -> int:
-        """Process CSV file"""
+    def _allowed_file(self, filename: str) -> bool:
+        """Check if file extension is allowed"""
+        return '.' in filename and \
+               filename.rsplit('.', 1)[1].lower() in self.allowed_extensions
+    
+    def _process_csv_file(self, source: DataSource, file_path: str) -> int:
+        """Process CSV file and create table/columns"""
         try:
-            logger.info(f"Processing CSV file: {file_path}")
+            # Read CSV with improved data type inference
+            df = self._read_file_to_dataframe(file_path, 'csv')
+            if df is None or df.empty:
+                raise ValueError("Could not read CSV file or file is empty")
             
-            # Try multiple encodings
-            encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-            df = None
-            
-            for encoding in encodings:
-                try:
-                    df = pd.read_csv(file_path, encoding=encoding, low_memory=False)
-                    logger.info(f"Successfully read CSV with encoding: {encoding}")
-                    break
-                except UnicodeDecodeError:
-                    continue
-                except Exception as e:
-                    logger.warning(f"Error reading CSV with {encoding}: {str(e)}")
-                    continue
-            
-            if df is None:
-                raise ValueError("Could not read CSV file with any supported encoding")
-            
-            # Check if DataFrame is empty
-            if df.empty:
-                raise ValueError("CSV file is empty")
-            
-            logger.info(f"CSV loaded: {len(df)} rows, {len(df.columns)} columns")
+            # Improve data types
+            df = self._improve_data_types(df)
             
             # Clean column names
             df.columns = [self._clean_column_name(col) for col in df.columns]
             
-            # Improve data type inference
-            df = self._improve_data_types(df)
+            # Remove completely empty rows and columns
+            df = df.dropna(how='all').dropna(axis=1, how='all')
             
-            # Create table name from filename
-            table_name = self._clean_table_name(os.path.splitext(os.path.basename(file_path))[0])
+            if df.empty:
+                raise ValueError("File contains no data after cleaning")
             
-            # Create table record
+            # Create table
+            table_name = self._clean_table_name(os.path.splitext(source.name)[0])
             table = Table(
                 source_id=source.id,
                 name=table_name,
-                display_name=table_name.replace('_', ' ').title(),
+                display_name=source.name,
                 row_count=len(df),
                 column_count=len(df.columns),
-                schema_json=self._extract_schema(df),
-                description=f"Imported from CSV file: {os.path.basename(file_path)}"
+                description=f"Imported from {source.name}"
             )
             db.session.add(table)
-            db.session.flush()  # Get table ID
+            db.session.flush()
             
-            logger.info(f"Created table record: {table_name} (ID: {table.id})")
-            
-            # Create column records
-            columns_created = 0
+            # Create columns
             for col_name in df.columns:
                 try:
                     column = self._create_column_from_series(table.id, col_name, df[col_name])
                     db.session.add(column)
-                    columns_created += 1
-                    logger.debug(f"Created column: {col_name}")
-                except Exception as e:
-                    logger.warning(f"Error creating column {col_name}: {str(e)}")
+                except Exception as col_error:
+                    logger.warning(f"Error creating column {col_name}: {str(col_error)}")
+                    continue
             
             db.session.commit()
-            logger.info(f"Successfully created table with {columns_created} columns")
             return 1
             
         except Exception as e:
@@ -124,86 +180,61 @@ class DataSourceService:
             logger.error(f"Error processing CSV file: {str(e)}")
             raise Exception(f"Error processing CSV file: {str(e)}")
     
-    def _process_excel(self, source: DataSource, file_path: str) -> int:
-        """Process Excel file (can have multiple sheets)"""
+    def _process_excel_file(self, source: DataSource, file_path: str) -> int:
+        """Process Excel file and create table/columns"""
         try:
-            logger.info(f"Processing Excel file: {file_path}")
-            
             # Read all sheets
-            try:
-                excel_file = pd.ExcelFile(file_path, engine='openpyxl')
-            except Exception:
-                # Try with xlrd for older Excel files
-                try:
-                    excel_file = pd.ExcelFile(file_path, engine='xlrd')
-                except Exception as e:
-                    raise ValueError(f"Could not read Excel file: {str(e)}")
-            
+            excel_file = pd.ExcelFile(file_path)
             tables_created = 0
-            base_name = self._clean_table_name(os.path.splitext(os.path.basename(file_path))[0])
-            
-            logger.info(f"Found {len(excel_file.sheet_names)} sheets: {excel_file.sheet_names}")
             
             for sheet_name in excel_file.sheet_names:
                 try:
-                    logger.info(f"Processing sheet: {sheet_name}")
+                    df = pd.read_excel(file_path, sheet_name=sheet_name)
                     
-                    # Read sheet
-                    df = pd.read_excel(file_path, sheet_name=sheet_name, engine=excel_file.engine)
-                    
-                    # Skip empty sheets
                     if df.empty:
-                        logger.warning(f"Skipping empty sheet: {sheet_name}")
                         continue
+                    
+                    # Improve data types
+                    df = self._improve_data_types(df)
                     
                     # Clean column names
                     df.columns = [self._clean_column_name(col) for col in df.columns]
                     
-                    # Improve data type inference
-                    df = self._improve_data_types(df)
+                    # Remove completely empty rows and columns
+                    df = df.dropna(how='all').dropna(axis=1, how='all')
                     
-                    # Create table name from filename and sheet
-                    if len(excel_file.sheet_names) > 1:
-                        table_name = f"{base_name}_{self._clean_table_name(sheet_name)}"
-                        display_name = f"{base_name} - {sheet_name}"
-                    else:
-                        table_name = base_name
-                        display_name = base_name.replace('_', ' ').title()
+                    if df.empty:
+                        continue
                     
-                    # Create table record
+                    # Create table
+                    table_name = self._clean_table_name(f"{os.path.splitext(source.name)[0]}_{sheet_name}")
                     table = Table(
                         source_id=source.id,
                         name=table_name,
-                        display_name=display_name,
+                        display_name=f"{source.name} - {sheet_name}",
                         row_count=len(df),
                         column_count=len(df.columns),
-                        schema_json=self._extract_schema(df),
-                        description=f"Imported from Excel sheet '{sheet_name}' in file: {os.path.basename(file_path)}"
+                        description=f"Sheet '{sheet_name}' from {source.name}"
                     )
                     db.session.add(table)
                     db.session.flush()
                     
-                    logger.info(f"Created table: {table_name} (ID: {table.id}) with {len(df)} rows, {len(df.columns)} columns")
-                    
-                    # Create column records
-                    columns_created = 0
+                    # Create columns
                     for col_name in df.columns:
                         try:
                             column = self._create_column_from_series(table.id, col_name, df[col_name])
                             db.session.add(column)
-                            columns_created += 1
-                        except Exception as e:
-                            logger.warning(f"Error creating column {col_name}: {str(e)}")
+                        except Exception as col_error:
+                            logger.warning(f"Error creating column {col_name}: {str(col_error)}")
+                            continue
                     
-                    logger.info(f"Created {columns_created} columns for table {table_name}")
                     tables_created += 1
                     
-                except Exception as e:
-                    logger.error(f"Error processing sheet {sheet_name}: {str(e)}")
+                except Exception as sheet_error:
+                    logger.warning(f"Error processing sheet {sheet_name}: {str(sheet_error)}")
                     continue
             
             db.session.commit()
-            logger.info(f"Successfully processed Excel file: created {tables_created} tables")
             return tables_created
             
         except Exception as e:
@@ -211,55 +242,52 @@ class DataSourceService:
             logger.error(f"Error processing Excel file: {str(e)}")
             raise Exception(f"Error processing Excel file: {str(e)}")
     
-    def _process_json(self, source: DataSource, file_path: str) -> int:
-        """Process JSON file"""
+    def _process_json_file(self, source: DataSource, file_path: str) -> int:
+        """Process JSON file and create table/columns"""
         try:
-            logger.info(f"Processing JSON file: {file_path}")
-            
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Convert to DataFrame
+            # Handle different JSON structures
             if isinstance(data, list):
+                # Array of objects
                 df = pd.json_normalize(data)
             elif isinstance(data, dict):
-                # If it's a dict, try to find the main data array
-                for key, value in data.items():
-                    if isinstance(value, list) and len(value) > 0:
-                        df = pd.json_normalize(value)
-                        break
+                # Check if it's a single object or has arrays
+                arrays = {k: v for k, v in data.items() if isinstance(v, list)}
+                if arrays:
+                    # Take the first array found
+                    key, array_data = next(iter(arrays.items()))
+                    df = pd.json_normalize(array_data)
                 else:
-                    # If no array found, create single row DataFrame
+                    # Single object, convert to single-row DataFrame
                     df = pd.json_normalize([data])
             else:
-                raise ValueError("JSON file format not supported")
+                raise ValueError("Unsupported JSON structure")
             
             if df.empty:
-                raise ValueError("JSON file contains no data")
+                raise ValueError("No data found in JSON file")
+            
+            # Improve data types
+            df = self._improve_data_types(df)
             
             # Clean column names
             df.columns = [self._clean_column_name(col) for col in df.columns]
             
-            # Improve data type inference
-            df = self._improve_data_types(df)
-            
-            # Create table name from filename
-            table_name = self._clean_table_name(os.path.splitext(os.path.basename(file_path))[0])
-            
-            # Create table record
+            # Create table
+            table_name = self._clean_table_name(os.path.splitext(source.name)[0])
             table = Table(
                 source_id=source.id,
                 name=table_name,
-                display_name=table_name.replace('_', ' ').title(),
+                display_name=source.name,
                 row_count=len(df),
                 column_count=len(df.columns),
-                schema_json=self._extract_schema(df),
-                description=f"Imported from JSON file: {os.path.basename(file_path)}"
+                description=f"Imported from {source.name}"
             )
             db.session.add(table)
             db.session.flush()
             
-            # Create column records
+            # Create columns
             for col_name in df.columns:
                 column = self._create_column_from_series(table.id, col_name, df[col_name])
                 db.session.add(column)
@@ -271,6 +299,235 @@ class DataSourceService:
             db.session.rollback()
             logger.error(f"Error processing JSON file: {str(e)}")
             raise Exception(f"Error processing JSON file: {str(e)}")
+    
+    def _read_file_to_dataframe(self, file_path: str, file_extension: str) -> Optional[pd.DataFrame]:
+        """Read various file formats into DataFrame"""
+        try:
+            if file_extension in ['csv', 'txt']:
+                # Try different separators and encodings
+                separators = [',', ';', '\t', '|']
+                encodings = ['utf-8', 'latin-1', 'cp1252']
+                
+                for encoding in encodings:
+                    for sep in separators:
+                        try:
+                            df = pd.read_csv(file_path, sep=sep, encoding=encoding, 
+                                           low_memory=False, na_values=['', 'NULL', 'null', 'N/A', 'n/a'])
+                            
+                            # Check if this looks like a good parse
+                            if len(df.columns) > 1 and len(df) > 0:
+                                return df
+                        except:
+                            continue
+                
+                # Fallback: try with default settings
+                return pd.read_csv(file_path, low_memory=False)
+                
+            elif file_extension in ['xlsx', 'xls']:
+                return pd.read_excel(file_path)
+                
+        except Exception as e:
+            logger.error(f"Error reading file {file_path}: {str(e)}")
+            return None
+    
+    def _improve_data_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Improve pandas data type inference"""
+        for col in df.columns:
+            # Skip if already numeric
+            if pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            
+            # Try to convert to numeric
+            try:
+                # First, handle common string representations of nulls
+                df[col] = df[col].replace(['', 'null', 'NULL', 'None', 'NaN', 'nan'], pd.NA)
+                
+                # Try to convert to numeric
+                numeric_col = pd.to_numeric(df[col], errors='coerce')
+                if not numeric_col.isna().all():
+                    # If we have some valid numbers, check if they're all integers
+                    if numeric_col.dropna().apply(lambda x: x.is_integer()).all():
+                        # Convert to Int64 (nullable integer)
+                        df[col] = numeric_col.astype('Int64')
+                    else:
+                        # Keep as float
+                        df[col] = numeric_col
+                    continue
+            except:
+                pass
+            
+            # Try to convert to datetime
+            try:
+                # Only try datetime conversion if there are some values that look like dates
+                sample_values = df[col].dropna().astype(str).head(100)
+                if any(re.search(r'\d{4}[-/]\d{1,2}[-/]\d{1,2}', str(val)) for val in sample_values):
+                    datetime_series = pd.to_datetime(df[col], errors='coerce')
+                    if not datetime_series.isna().all():
+                        df[col] = datetime_series
+                        continue
+            except:
+                pass
+        
+        return df
+    
+    def _create_column_from_series(self, table_id: int, col_name: str, series: pd.Series) -> Column:
+        """Create a Column object from a pandas Series"""
+        # Basic statistics
+        null_count = int(series.isnull().sum())
+        distinct_count = int(series.nunique())
+        total_count = len(series)
+        
+        # Data type detection
+        data_type = self._determine_sql_data_type(series)
+        
+        # Sample values (non-null, unique, first 10)
+        sample_values = []
+        try:
+            non_null_values = series.dropna().unique()[:10]
+            sample_values = [str(v) for v in non_null_values if str(v) not in ['nan', 'NaT', 'None']]
+        except Exception:
+            pass
+        
+        # Statistical measures for numeric columns
+        min_value = None
+        max_value = None
+        avg_value = None
+        
+        if pd.api.types.is_numeric_dtype(series):
+            try:
+                if not series.empty and not series.isna().all():
+                    min_value = round(float(series.min()), 3)
+                    max_value = round(float(series.max()), 3)
+                    avg_value = round(float(series.mean()), 3)
+            except Exception:
+                pass
+        
+        # PII detection
+        pii_flag = self._detect_pii(col_name, series)
+        
+        # Business context hints
+        business_context = self._infer_business_context(col_name, series)
+        
+        # FIXED: Use correct column names that match the Column model
+        return Column(
+            table_id=table_id,
+            name=col_name,
+            data_type=data_type,
+            is_nullable=null_count > 0,
+            null_count=null_count,
+            distinct_count=distinct_count,
+            sample_values=sample_values,  # Store as list, not JSON string
+            min_value=min_value,
+            max_value=max_value,
+            avg_value=avg_value,
+            pii_flag=pii_flag,  # FIXED: was is_pii
+            business_category=business_context  # FIXED: was business_context
+        )
+    
+    def _determine_sql_data_type(self, series: pd.Series) -> str:
+        """Determine appropriate SQL data type"""
+        if pd.api.types.is_integer_dtype(series):
+            return 'INTEGER'
+        elif pd.api.types.is_float_dtype(series):
+            return 'FLOAT'
+        elif pd.api.types.is_bool_dtype(series):
+            return 'BOOLEAN'
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            return 'DATETIME'
+        elif pd.api.types.is_categorical_dtype(series):
+            return 'VARCHAR'
+        else:
+            # Check max length for strings
+            try:
+                max_length = series.astype(str).str.len().max()
+                if max_length > 255:
+                    return 'TEXT'
+                else:
+                    return 'VARCHAR'
+            except:
+                return 'TEXT'
+    
+    def _detect_pii(self, col_name: str, series: pd.Series) -> bool:
+        """Detect potential PII in column"""
+        import re
+        
+        col_lower = col_name.lower()
+        
+        # Common PII column names
+        pii_keywords = [
+            'email', 'phone', 'ssn', 'social', 'security', 'passport',
+            'license', 'credit', 'card', 'account', 'routing', 'tax',
+            'firstname', 'lastname', 'fullname', 'address', 'zip', 'postal'
+        ]
+        
+        if any(keyword in col_lower for keyword in pii_keywords):
+            return True
+        
+        # Pattern-based detection (sample a few values)
+        try:
+            sample_values = series.dropna().astype(str).head(50)
+            
+            # Email pattern
+            email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+            if sample_values.str.match(email_pattern).any():
+                return True
+            
+            # Phone pattern
+            phone_pattern = r'(\+\d{1,3}[-.\s]?)?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}'
+            if sample_values.str.match(phone_pattern).any():
+                return True
+            
+            # SSN pattern (US)
+            ssn_pattern = r'\d{3}-?\d{2}-?\d{4}'
+            if sample_values.str.match(ssn_pattern).any():
+                return True
+                
+        except Exception:
+            pass
+        
+        return False
+    
+    def _infer_business_context(self, col_name: str, series: pd.Series) -> str:
+        """Infer business context/category for the column"""
+        col_lower = col_name.lower()
+        
+        # ID/Key patterns
+        if any(keyword in col_lower for keyword in ['id', 'key', 'ref', 'pk', 'fk']):
+            return 'identifier'
+        
+        # Date/Time patterns
+        if any(keyword in col_lower for keyword in ['date', 'time', 'created', 'updated', 'modified']):
+            return 'temporal'
+        
+        # Amount/Money patterns
+        if any(keyword in col_lower for keyword in ['amount', 'price', 'cost', 'total', 'sum', 'revenue', 'sales']):
+            return 'financial'
+        
+        # Count/Quantity patterns
+        if any(keyword in col_lower for keyword in ['count', 'quantity', 'qty', 'number', 'num']):
+            return 'quantity'
+        
+        # Status/Flag patterns
+        if any(keyword in col_lower for keyword in ['status', 'state', 'flag', 'active', 'enabled', 'type']):
+            return 'categorical'
+        
+        # Name/Description patterns
+        if any(keyword in col_lower for keyword in ['name', 'title', 'description', 'comment', 'note']):
+            return 'descriptive'
+        
+        # Geographic patterns
+        if any(keyword in col_lower for keyword in ['address', 'city', 'state', 'country', 'zip', 'postal', 'region']):
+            return 'geographic'
+        
+        # Check data characteristics
+        if pd.api.types.is_numeric_dtype(series):
+            unique_ratio = series.nunique() / len(series) if len(series) > 0 else 0
+            if unique_ratio < 0.1:  # Low cardinality numeric
+                return 'categorical'
+            else:
+                return 'measure'
+        
+        return 'attribute'
     
     def _clean_table_name(self, name: str) -> str:
         """Clean table name to be database-friendly"""
@@ -306,330 +563,66 @@ class DataSourceService:
         # Limit length
         return name[:50] if name else 'unnamed_column'
     
-    def _improve_data_types(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Improve pandas data type inference"""
-        for col in df.columns:
-            # Skip if already numeric
-            if pd.api.types.is_numeric_dtype(df[col]):
-                continue
+    def _generate_preview(self, file_path: str, file_extension: str, max_rows: int = 10) -> List[List]:
+        """Generate preview data for the frontend"""
+        try:
+            df = self._read_file_to_dataframe(file_path, file_extension)
+            if df is None or df.empty:
+                return []
             
-            # Try to convert to numeric
-            try:
-                # First, handle common string representations of nulls
-                df[col] = df[col].replace(['', 'null', 'NULL', 'None', 'NaN', 'nan'], pd.NA)
-                
-                # Try to convert to numeric
-                numeric_col = pd.to_numeric(df[col], errors='coerce')
-                if not numeric_col.isna().all():
-                    # If we have some valid numbers, check if they're all integers
-                    if numeric_col.dropna().apply(lambda x: x.is_integer()).all():
-                        df[col] = numeric_col.astype('Int64')  # Nullable integer
+            # Clean column names for consistency
+            df.columns = [self._clean_column_name(col) for col in df.columns]
+            
+            # Take first few rows
+            preview_df = df.head(max_rows)
+            
+            # Convert to list of lists for JSON serialization
+            # Include headers as first row
+            preview_data = []
+            
+            # Add header row
+            preview_data.append(list(df.columns))
+            
+            # Add data rows
+            for _, row in preview_df.iterrows():
+                # Convert each value to string, handling NaN/None
+                row_data = []
+                for val in row:
+                    if pd.isna(val):
+                        row_data.append("")
                     else:
-                        df[col] = numeric_col
-                    continue
-            except:
-                pass
+                        row_data.append(str(val))
+                preview_data.append(row_data)
             
-            # Try to convert to datetime
-            try:
-                datetime_col = pd.to_datetime(df[col], errors='coerce', infer_datetime_format=True)
-                if not datetime_col.isna().all():
-                    df[col] = datetime_col
-                    continue
-            except:
-                pass
-            
-            # Try to convert to boolean
-            try:
-                if df[col].dropna().str.lower().isin(['true', 'false', '1', '0', 'yes', 'no']).all():
-                    bool_map = {'true': True, 'false': False, '1': True, '0': False, 'yes': True, 'no': False}
-                    df[col] = df[col].str.lower().map(bool_map)
-                    continue
-            except:
-                pass
-        
-        return df
-    
-    def _extract_schema(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Extract schema information from DataFrame"""
-        schema = {
-            'columns': [],
-            'data_types': {},
-            'sample_data': {}
-        }
-        
-        for col in df.columns:
-            col_info = {
-                'name': col,
-                'dtype': str(df[col].dtype),
-                'null_count': int(df[col].isnull().sum()),
-                'unique_count': int(df[col].nunique()),
-                'memory_usage': int(df[col].memory_usage(deep=True))
-            }
-            
-            # Add sample values (non-null, unique)
-            sample_values = df[col].dropna().unique()[:5]
-            col_info['sample_values'] = [str(v) for v in sample_values]
-            
-            schema['columns'].append(col_info)
-            schema['data_types'][col] = str(df[col].dtype)
-            schema['sample_data'][col] = col_info['sample_values']
-        
-        return schema
-    
-    def _create_column_from_series(self, table_id: int, col_name: str, series: pd.Series) -> Column:
-        """Create Column object from pandas Series"""
-        
-        # Infer data type
-        data_type = self._pandas_to_sql_type(series.dtype)
-        
-        # Calculate statistics
-        null_count = int(series.isnull().sum())
-        distinct_count = int(series.nunique())
-        
-        # Get sample values (non-null, unique, first 10)
-        sample_values = []
-        try:
-            non_null_values = series.dropna().unique()[:10]
-            sample_values = [str(v) for v in non_null_values if str(v) != 'nan']
-        except:
-            pass
-        
-        # Calculate min/max for numeric columns
-        min_value = None
-        max_value = None
-        avg_value = None
-        
-        if pd.api.types.is_numeric_dtype(series):
-            try:
-                if not series.empty and not series.isna().all():
-                    min_value = float(series.min())
-                    max_value = float(series.max())
-                    avg_value = float(series.mean())
-                    
-                    # Round to 3 decimal places
-                    min_value = round(min_value, 3)
-                    max_value = round(max_value, 3)
-                    avg_value = round(avg_value, 3)
-            except:
-                pass
-        
-        # Detect PII
-        pii_flag = self._detect_pii(col_name, sample_values)
-        
-        # Infer business category
-        business_category = self._infer_business_category(col_name)
-        
-        return Column(
-            table_id=table_id,
-            name=col_name,
-            display_name=col_name.replace('_', ' ').title(),
-            data_type=data_type,
-            is_nullable=null_count > 0,
-            distinct_count=distinct_count,
-            null_count=null_count,
-            min_value=min_value,
-            max_value=max_value,
-            avg_value=avg_value,
-            sample_values=sample_values,
-            pii_flag=pii_flag,
-            business_category=business_category,
-            description=f"Column from imported data: {data_type}"
-        )
-    
-    def _pandas_to_sql_type(self, dtype) -> str:
-        """Convert pandas dtype to SQL type string"""
-        dtype_str = str(dtype).lower()
-        
-        if 'int' in dtype_str:
-            return 'INTEGER'
-        elif 'float' in dtype_str:
-            return 'FLOAT'
-        elif 'bool' in dtype_str:
-            return 'BOOLEAN'
-        elif 'datetime' in dtype_str or 'timestamp' in dtype_str:
-            return 'DATETIME'
-        elif 'date' in dtype_str:
-            return 'DATE'
-        elif 'object' in dtype_str or 'string' in dtype_str:
-            return 'TEXT'
-        else:
-            return 'TEXT'
-    
-    def _detect_pii(self, column_name: str, sample_values: List[str]) -> bool:
-        """Detect if column might contain PII"""
-        pii_keywords = [
-            'email', 'phone', 'ssn', 'social', 'credit_card', 'password',
-            'address', 'name', 'firstname', 'lastname', 'dob', 'birth'
-        ]
-        
-        column_lower = column_name.lower()
-        for keyword in pii_keywords:
-            if keyword in column_lower:
-                return True
-        
-        # Check sample values for patterns
-        for value in sample_values[:5]:  # Check first 5 samples
-            if self._looks_like_email(value) or self._looks_like_phone(value):
-                return True
-        
-        return False
-    
-    def _looks_like_email(self, value: str) -> bool:
-        """Check if value looks like an email"""
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(email_pattern, str(value)) is not None
-    
-    def _looks_like_phone(self, value: str) -> bool:
-        """Check if value looks like a phone number"""
-        phone_pattern = r'^[\+]?[\d\s\-\(\)]{10,}$'
-        return re.match(phone_pattern, str(value)) is not None
-    
-    def _infer_business_category(self, column_name: str) -> str:
-        """Infer business category from column name"""
-        name_lower = column_name.lower()
-        
-        if any(word in name_lower for word in ['id', 'key', 'ref']):
-            return 'identifier'
-        elif any(word in name_lower for word in ['name', 'title', 'description']):
-            return 'descriptive'
-        elif any(word in name_lower for word in ['date', 'time', 'created', 'updated']):
-            return 'temporal'
-        elif any(word in name_lower for word in ['amount', 'price', 'cost', 'total', 'sum']):
-            return 'financial'
-        elif any(word in name_lower for word in ['count', 'quantity', 'number', 'size']):
-            return 'quantitative'
-        elif any(word in name_lower for word in ['status', 'state', 'flag', 'type']):
-            return 'categorical'
-        else:
-            return 'general'
-    
-    def get_table_sample_data(self, table_id: int, limit: int = 100) -> Dict[str, Any]:
-        """Get sample data from a table"""
-        try:
-            table = Table.query.get(table_id)
-            if not table:
-                raise ValueError(f"Table {table_id} not found")
-            
-            source = table.source
-            
-            if source.type == 'file':
-                # For file sources, read from the original file
-                return self._get_file_sample_data(source, table, limit)
-            elif source.type == 'database':
-                # For database sources, query the actual table
-                return self._get_database_sample_data(source, table, limit)
-            else:
-                raise ValueError(f"Unsupported source type: {source.type}")
-                
-        except Exception as e:
-            logger.error(f"Error getting sample data for table {table_id}: {str(e)}")
-            raise
-    
-    def _get_file_sample_data(self, source: DataSource, table: Table, limit: int) -> Dict[str, Any]:
-        """Get sample data from file source"""
-        try:
-            if source.subtype == 'csv':
-                df = pd.read_csv(source.file_path, nrows=limit)
-            elif source.subtype in ['xlsx', 'xls']:
-                # For Excel files with multiple sheets, determine which sheet
-                sheet_name = None
-                if '_' in table.name:
-                    # Try to extract sheet name from table name
-                    parts = table.name.split('_')
-                    if len(parts) > 1:
-                        sheet_name = '_'.join(parts[1:])
-                
-                try:
-                    df = pd.read_excel(source.file_path, sheet_name=sheet_name, nrows=limit)
-                except:
-                    # Fallback to first sheet
-                    df = pd.read_excel(source.file_path, nrows=limit)
-            else:
-                raise ValueError(f"Unsupported file type for sampling: {source.subtype}")
-            
-            # Clean up the data for JSON serialization
-            df = df.fillna('')  # Replace NaN with empty string
-            
-            # Convert to records
-            data = []
-            for _, row in df.iterrows():
-                row_dict = {}
-                for col, value in row.items():
-                    # Handle different data types for JSON serialization
-                    if pd.isna(value):
-                        row_dict[col] = None
-                    elif isinstance(value, (pd.Timestamp, np.datetime64)):
-                        row_dict[col] = str(value)
-                    elif isinstance(value, (np.integer, np.floating)):
-                        row_dict[col] = float(value) if np.isfinite(value) else None
-                    elif isinstance(value, bool):
-                        row_dict[col] = bool(value)
-                    else:
-                        row_dict[col] = str(value)
-                data.append(row_dict)
-            
-            return {
-                'columns': df.columns.tolist(),
-                'data': data,
-                'total_rows': len(data)
-            }
+            return preview_data
             
         except Exception as e:
-            logger.error(f"Error getting file sample data: {str(e)}")
-            raise
+            logger.error(f"Error generating preview: {str(e)}")
+            return []
     
-    def _get_database_sample_data(self, source: DataSource, table: Table, limit: int) -> Dict[str, Any]:
-        """Get sample data from database source"""
-        connection_string = self._build_connection_string(source.connection_config)
-        engine = create_engine(connection_string)
-        
-        with engine.connect() as conn:
-            result = conn.execute(text(f"SELECT * FROM {table.name} LIMIT {limit}"))
-            columns = list(result.keys())
-            data = [dict(row) for row in result]
-        
-        return {
-            'columns': columns,
-            'data': data,
-            'total_rows': len(data)
-        }
-    
-    def _build_connection_string(self, config: Dict[str, Any]) -> str:
-        """Build database connection string"""
-        db_type = config['type']
-        host = config['host']
-        port = config.get('port', 5432)
-        database = config['database']
-        username = config['username']
-        password = config['password']
-        
-        if db_type == 'postgresql':
-            return f"postgresql://{username}:{password}@{host}:{port}/{database}"
-        elif db_type == 'mysql':
-            return f"mysql://{username}:{password}@{host}:{port}/{database}"
-        elif db_type == 'sqlite':
-            return f"sqlite:///{database}"
-        else:
-            raise ValueError(f"Unsupported database type: {db_type}")
-    
-    def import_database_schema(self, source_id: int) -> int:
-        """Import schema from database source"""
+    def import_database_schema(self, project_id: int, connection_string: str) -> int:
+        """Import schema from an existing database"""
         try:
-            source = DataSource.query.get(source_id)
-            if not source:
-                raise ValueError(f"Data source {source_id} not found")
-            
-            connection_string = self._build_connection_string(source.connection_config)
+            # Create engine and inspector
             engine = create_engine(connection_string)
-            
             inspector = inspect(engine)
-            table_names = inspector.get_table_names()
+            
+            # Create data source record
+            source = DataSource(
+                project_id=project_id,
+                name="Database Import",
+                type='database',
+                connection_string=connection_string,
+                ingest_status='processing'
+            )
+            db.session.add(source)
+            db.session.flush()
             
             tables_created = 0
+            table_names = inspector.get_table_names()
             
             for table_name in table_names:
-                # Get table metadata
+                # Get table info
                 columns_info = inspector.get_columns(table_name)
                 pk_constraint = inspector.get_pk_constraint(table_name)
                 fk_constraints = inspector.get_foreign_keys(table_name)
@@ -680,3 +673,18 @@ class DataSourceService:
             db.session.rollback()
             logger.error(f"Error importing database schema: {str(e)}")
             raise
+    
+    def _infer_business_category(self, col_name: str) -> str:
+        """Infer business category from column name (for database import)"""
+        col_lower = col_name.lower()
+        
+        if any(keyword in col_lower for keyword in ['id', 'key']):
+            return 'identifier'
+        elif any(keyword in col_lower for keyword in ['name', 'title']):
+            return 'descriptive'
+        elif any(keyword in col_lower for keyword in ['date', 'time']):
+            return 'temporal'
+        elif any(keyword in col_lower for keyword in ['amount', 'price', 'cost']):
+            return 'financial'
+        else:
+            return 'attribute'

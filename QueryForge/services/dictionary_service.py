@@ -42,27 +42,46 @@ class DictionaryService:
         try:
             suggestions = []
             
+            # Validate project exists
+            project = db.session.get(Project, project_id)
+            if not project:
+                logger.warning(f"Project {project_id} not found")
+                return []
+            
             # Get all tables and columns for the project
             tables = db.session.query(Table).join(DataSource).filter(
                 DataSource.project_id == project_id
             ).all()
             
+            if not tables:
+                logger.info(f"No tables found for project {project_id}")
+                return []
+            
             # Analyze column names and generate suggestions
             for table in tables:
-                table_suggestions = self._analyze_table_for_terms(table)
-                suggestions.extend(table_suggestions)
+                try:
+                    table_suggestions = self._analyze_table_for_terms(table)
+                    suggestions.extend(table_suggestions)
+                except Exception as e:
+                    logger.warning(f"Error analyzing table {table.name}: {str(e)}")
+                    continue
             
             # Remove duplicates and rank by confidence
             unique_suggestions = self._deduplicate_suggestions(suggestions)
             ranked_suggestions = sorted(unique_suggestions, 
-                                      key=lambda x: x['confidence_score'], 
+                                      key=lambda x: x.get('confidence_score', 0), 
                                       reverse=True)
             
-            return ranked_suggestions[:50]  # Return top 50 suggestions
+            # Limit to top 50 suggestions
+            final_suggestions = ranked_suggestions[:50]
+            
+            logger.info(f"Generated {len(final_suggestions)} dictionary suggestions for project {project_id}")
+            return final_suggestions
             
         except Exception as e:
             logger.error(f"Error generating dictionary suggestions: {str(e)}")
-            raise
+            # Return empty list instead of raising exception
+            return []
     
     def _analyze_table_for_terms(self, table: Table) -> List[Dict[str, Any]]:
         """Analyze a table and generate term suggestions"""
@@ -76,63 +95,61 @@ class DictionaryService:
         
         # Analyze column names
         for column in table.columns:
-            column_suggestions = self._extract_terms_from_name(
-                column.name, 'column', column.id, f"{table.name}.{column.name}"
-            )
-            suggestions.extend(column_suggestions)
+            try:
+                column_suggestions = self._extract_terms_from_name(
+                    column.name, 'column', column.id, f"{table.name}.{column.name}"
+                )
+                suggestions.extend(column_suggestions)
+            except Exception as e:
+                logger.warning(f"Error analyzing column {column.name}: {str(e)}")
+                continue
         
         return suggestions
     
     def _extract_terms_from_name(self, name: str, object_type: str, 
                                 object_id: int, full_name: str) -> List[Dict[str, Any]]:
-        """Extract potential business terms from a name"""
+        """Extract business terms from a name"""
         suggestions = []
         name_lower = name.lower()
         
-        # Check against business patterns
+        # Check business patterns
         for category, patterns in self.business_patterns.items():
             for pattern in patterns:
                 if pattern in name_lower:
                     confidence = self._calculate_confidence(name_lower, pattern, category)
-                    if confidence > 0.3:  # Minimum confidence threshold
-                        suggestion = self._create_suggestion(
-                            name, category, pattern, confidence, 
-                            object_type, object_id, full_name
-                        )
-                        suggestions.append(suggestion)
+                    suggestion = self._create_suggestion(
+                        name, category, pattern, confidence, object_type, object_id, full_name
+                    )
+                    suggestions.append(suggestion)
         
-        # Check against domain patterns
+        # Check domain patterns
         for domain, patterns in self.domain_patterns.items():
             for pattern in patterns:
                 if pattern in name_lower:
                     confidence = self._calculate_confidence(name_lower, pattern, domain)
-                    if confidence > 0.3:
-                        suggestion = self._create_domain_suggestion(
-                            name, domain, pattern, confidence,
-                            object_type, object_id, full_name
-                        )
-                        suggestions.append(suggestion)
+                    suggestion = self._create_suggestion(
+                        name, domain, pattern, confidence, object_type, object_id, full_name
+                    )
+                    suggestions.append(suggestion)
         
         return suggestions
     
     def _calculate_confidence(self, name: str, pattern: str, category: str) -> float:
-        """Calculate confidence score for a term match"""
+        """Calculate confidence score for a term suggestion"""
         base_confidence = 0.5
         
-        # Exact match gets higher confidence
+        # Exact match
         if name == pattern:
             base_confidence = 0.9
-        elif name.startswith(pattern) or name.endswith(pattern):
-            base_confidence = 0.8
+        # Contains pattern
         elif pattern in name:
+            base_confidence = 0.7
+        # Partial match
+        elif any(p in name for p in pattern.split('_')):
             base_confidence = 0.6
         
-        # Adjust based on pattern length and specificity
-        if len(pattern) > 6:  # Longer patterns are more specific
-            base_confidence += 0.1
-        
-        # Adjust based on category importance
-        important_categories = ['customer', 'revenue', 'transaction']
+        # Boost confidence for important categories
+        important_categories = ['customer', 'revenue', 'transaction', 'product']
         if category in important_categories:
             base_confidence += 0.1
         
@@ -176,11 +193,15 @@ class DictionaryService:
             'identifier': {
                 'term': 'Identifier',
                 'definition': 'A unique value used to distinguish and reference a specific entity'
+            },
+            'date': {
+                'term': 'Date',
+                'definition': 'A temporal reference point indicating when an event occurred'
             }
         }
         
         mapping = term_mappings.get(category, {
-            'term': pattern.title(),
+            'term': pattern.title().replace('_', ' '),
             'definition': f'A {category} field containing {pattern} information'
         })
         
@@ -193,53 +214,27 @@ class DictionaryService:
             'source_object_type': object_type,
             'source_object_id': object_id,
             'source_name': full_name,
-            'pattern_matched': pattern,
-            'synonyms': self._generate_synonyms(pattern),
-            'abbreviations': self._generate_abbreviations(pattern)
-        }
-    
-    def _create_domain_suggestion(self, name: str, domain: str, pattern: str,
-                                confidence: float, object_type: str, object_id: int,
-                                full_name: str) -> Dict[str, Any]:
-        """Create a domain-specific suggestion"""
-        
-        domain_definitions = {
-            'finance': f'A financial term related to {pattern} in accounting and monetary operations',
-            'hr': f'A human resources term related to {pattern} and employee management',
-            'sales': f'A sales-related term involving {pattern} and customer acquisition',
-            'marketing': f'A marketing term related to {pattern} and customer engagement',
-            'operations': f'An operational term related to {pattern} and business processes'
-        }
-        
-        return {
-            'term': pattern.title(),
-            'definition': domain_definitions.get(domain, f'A {domain} term related to {pattern}'),
-            'category': 'domain_term',
-            'domain': domain,
-            'confidence_score': round(confidence, 3),
-            'source_object_type': object_type,
-            'source_object_id': object_id,
-            'source_name': full_name,
-            'pattern_matched': pattern,
-            'synonyms': self._generate_synonyms(pattern),
-            'abbreviations': self._generate_abbreviations(pattern)
+            'synonyms': self._generate_synonyms(category),
+            'abbreviations': self._generate_abbreviations(category)
         }
     
     def _infer_domain(self, name: str) -> Optional[str]:
-        """Infer the business domain from a name"""
+        """Infer business domain from name"""
         name_lower = name.lower()
         
         for domain, patterns in self.domain_patterns.items():
             if any(pattern in name_lower for pattern in patterns):
                 return domain
         
-        # Default inference based on common patterns
-        if any(word in name_lower for word in ['price', 'cost', 'revenue', 'profit']):
-            return 'finance'
-        elif any(word in name_lower for word in ['employee', 'staff', 'manager']):
-            return 'hr'
-        elif any(word in name_lower for word in ['customer', 'client', 'sale']):
+        # Default domain inference
+        if any(keyword in name_lower for keyword in ['sale', 'order', 'customer']):
             return 'sales'
+        elif any(keyword in name_lower for keyword in ['employee', 'hr', 'staff']):
+            return 'hr'
+        elif any(keyword in name_lower for keyword in ['finance', 'payment', 'cost']):
+            return 'finance'
+        elif any(keyword in name_lower for keyword in ['product', 'inventory', 'stock']):
+            return 'operations'
         
         return None
     
@@ -253,7 +248,8 @@ class DictionaryService:
             'amount': ['value', 'sum', 'total'],
             'quantity': ['count', 'number', 'volume'],
             'status': ['state', 'condition', 'stage'],
-            'id': ['identifier', 'key', 'reference']
+            'identifier': ['id', 'key', 'reference'],
+            'date': ['timestamp', 'time', 'when']
         }
         
         return synonym_map.get(term.lower(), [])
@@ -268,7 +264,8 @@ class DictionaryService:
             'identifier': ['id'],
             'number': ['num', 'no'],
             'reference': ['ref'],
-            'status': ['stat']
+            'status': ['stat'],
+            'date': ['dt']
         }
         
         return abbreviation_map.get(term.lower(), [])
@@ -355,23 +352,19 @@ class DictionaryService:
     def update_entry(self, entry_id: int, updates: Dict[str, Any]) -> DictionaryEntry:
         """Update a dictionary entry"""
         try:
-            entry = DictionaryEntry.query.get(entry_id)
+            entry = db.session.get(DictionaryEntry, entry_id)
             if not entry:
                 raise ValueError(f"Dictionary entry {entry_id} not found")
             
             # Update allowed fields
             allowed_fields = [
-                'term', 'definition', 'category', 'domain', 'synonyms',
-                'abbreviations', 'status', 'approved_by'
+                'term', 'definition', 'category', 'domain', 
+                'synonyms', 'abbreviations', 'status'
             ]
             
-            for field, value in updates.items():
-                if field in allowed_fields and hasattr(entry, field):
-                    setattr(entry, field, value)
-            
-            # Set approval timestamp if status changes to approved
-            if updates.get('status') == 'approved' and entry.status != 'approved':
-                entry.approved_at = datetime.utcnow()
+            for field in allowed_fields:
+                if field in updates:
+                    setattr(entry, field, updates[field])
             
             entry.updated_at = datetime.utcnow()
             db.session.commit()
@@ -380,98 +373,55 @@ class DictionaryService:
             
         except Exception as e:
             db.session.rollback()
-            logger.error(f"Error updating dictionary entry: {str(e)}")
+            logger.error(f"Error updating dictionary entry {entry_id}: {str(e)}")
             raise
     
-    def search_entries(self, project_id: int, query: str, 
-                      filters: Optional[Dict[str, Any]] = None) -> List[DictionaryEntry]:
-        """Search dictionary entries"""
+    def delete_entry(self, entry_id: int) -> bool:
+        """Delete a dictionary entry"""
         try:
-            base_query = DictionaryEntry.query.filter_by(project_id=project_id)
+            entry = db.session.get(DictionaryEntry, entry_id)
+            if not entry:
+                raise ValueError(f"Dictionary entry {entry_id} not found")
             
-            # Apply text search
-            if query:
-                search_filter = (
-                    DictionaryEntry.term.ilike(f'%{query}%') |
-                    DictionaryEntry.definition.ilike(f'%{query}%')
+            db.session.delete(entry)
+            db.session.commit()
+            
+            return True
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error deleting dictionary entry {entry_id}: {str(e)}")
+            raise
+    
+    def get_entries_by_project(self, project_id: int, status: Optional[str] = None) -> List[DictionaryEntry]:
+        """Get dictionary entries for a project"""
+        try:
+            query = DictionaryEntry.query.filter_by(project_id=project_id)
+            
+            if status:
+                query = query.filter_by(status=status)
+            
+            return query.order_by(DictionaryEntry.term).all()
+            
+        except Exception as e:
+            logger.error(f"Error getting dictionary entries: {str(e)}")
+            raise
+    
+    def search_entries(self, project_id: int, search_term: str) -> List[DictionaryEntry]:
+        """Search dictionary entries by term or definition"""
+        try:
+            search_pattern = f"%{search_term}%"
+            
+            entries = DictionaryEntry.query.filter(
+                DictionaryEntry.project_id == project_id,
+                db.or_(
+                    DictionaryEntry.term.ilike(search_pattern),
+                    DictionaryEntry.definition.ilike(search_pattern)
                 )
-                base_query = base_query.filter(search_filter)
+            ).order_by(DictionaryEntry.term).all()
             
-            # Apply filters
-            if filters:
-                if filters.get('category'):
-                    base_query = base_query.filter_by(category=filters['category'])
-                if filters.get('domain'):
-                    base_query = base_query.filter_by(domain=filters['domain'])
-                if filters.get('status'):
-                    base_query = base_query.filter_by(status=filters['status'])
-            
-            return base_query.order_by(DictionaryEntry.term).all()
+            return entries
             
         except Exception as e:
             logger.error(f"Error searching dictionary entries: {str(e)}")
-            raise
-    
-    def get_statistics(self, project_id: int) -> Dict[str, Any]:
-        """Get dictionary statistics for a project"""
-        try:
-            entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
-            
-            # Count by category
-            categories = Counter(entry.category for entry in entries if entry.category)
-            
-            # Count by domain
-            domains = Counter(entry.domain for entry in entries if entry.domain)
-            
-            # Count by status
-            statuses = Counter(entry.status for entry in entries if entry.status)
-            
-            # Count auto-generated vs manual
-            auto_generated = len([e for e in entries if e.is_auto_generated])
-            manual = len(entries) - auto_generated
-            
-            return {
-                'total_entries': len(entries),
-                'categories': dict(categories),
-                'domains': dict(domains),
-                'statuses': dict(statuses),
-                'auto_generated': auto_generated,
-                'manual': manual,
-                'completion_rate': round(
-                    len([e for e in entries if e.status == 'approved']) / len(entries) * 100, 1
-                ) if entries else 0
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting dictionary statistics: {str(e)}")
-            raise
-    
-    def export_dictionary(self, project_id: int, format: str = 'json') -> Dict[str, Any]:
-        """Export dictionary entries"""
-        try:
-            entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
-            
-            export_data = []
-            for entry in entries:
-                export_data.append({
-                    'term': entry.term,
-                    'definition': entry.definition,
-                    'category': entry.category,
-                    'domain': entry.domain,
-                    'synonyms': entry.synonyms or [],
-                    'abbreviations': entry.abbreviations or [],
-                    'status': entry.status,
-                    'created_at': entry.created_at.isoformat() if entry.created_at else None,
-                    'updated_at': entry.updated_at.isoformat() if entry.updated_at else None
-                })
-            
-            return {
-                'project_id': project_id,
-                'exported_at': datetime.utcnow().isoformat(),
-                'total_entries': len(export_data),
-                'entries': export_data
-            }
-            
-        except Exception as e:
-            logger.error(f"Error exporting dictionary: {str(e)}")
             raise

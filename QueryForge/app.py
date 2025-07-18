@@ -1,77 +1,74 @@
-# app.py
-import os
-import logging
+# C:\Users\Praveen.TN\Downloads\Experiments\sqrag\QueryForge\app.py
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
-import traceback
-import uuid
 from datetime import datetime
+import os
+import logging
 
-# Import configuration and models
-from config import get_config
-from models import db, Project, DataSource, Table, Column, DictionaryEntry, Embedding, Index, SearchLog, NLQFeedback
+# Database and models
+from models import db, Project, DataSource, Table, Column, DictionaryEntry, Embedding, Index, SearchLog
 
-# Import services
+# Services
 from services.data_source_service import DataSourceService
-from services.dictionary_service import DictionaryService
 from services.embedding_service import EmbeddingService
 from services.search_service import SearchService
-from services.chat_service import ChatService
+from services.dictionary_service import DictionaryService
 from services.admin_service import AdminService
+from services.chat_service import ChatService
+
+# Configuration
+from config import Config
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global service instances
+_services_initialized = False
+data_source_service = None
+embedding_service = None
+search_service = None
+dictionary_service = None
+admin_service = None
+chat_service = None
 
 def create_app(config_name='development'):
     """Application factory"""
-    app = Flask(__name__)
+    global _services_initialized, data_source_service, embedding_service, search_service, dictionary_service, admin_service, chat_service
     
-    # Load configuration
-    config_class = get_config(config_name)
-    app.config.from_object(config_class)
+    app = Flask(__name__, static_folder='static')
     
-    # Initialize extensions
+    # Configuration
+    app.config.from_object(Config)
+    
+    # Enable CORS
+    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    
+    # Initialize database
     db.init_app(app)
-    CORS(app, origins="*")
     
-    # Configure logging
-    if not app.debug:
-        logging.basicConfig(level=logging.INFO)
-    
-    # Create upload directory
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
-    os.makedirs('indexes', exist_ok=True)
-    
-    # Initialize services with app context
+    # Initialize services within app context
     with app.app_context():
-        data_source_service = DataSourceService()
-        dictionary_service = DictionaryService()
-        embedding_service = EmbeddingService(app)  # Pass app for context
-        search_service = SearchService()
-        chat_service = ChatService()
-        admin_service = AdminService()
+        if not _services_initialized:
+            try:
+                data_source_service = DataSourceService()
+                embedding_service = EmbeddingService(app)
+                search_service = SearchService()
+                dictionary_service = DictionaryService()
+                admin_service = AdminService()
+                chat_service = ChatService()
+                _services_initialized = True
+                app.logger.info("All services initialized successfully")
+            except Exception as e:
+                app.logger.error(f"Error initializing services: {str(e)}")
+                # Continue with app creation even if services fail
     
-    # Configure logging
-    logging.basicConfig(level=logging.INFO)
-    app.logger.setLevel(logging.INFO)
-
-    # =================== ERROR HANDLERS ===================
+    # Routes
     
-    @app.errorhandler(400)
-    def bad_request(error):
-        return jsonify({'success': False, 'error': 'Bad request', 'message': str(error)}), 400
-    
-    @app.errorhandler(404)
-    def not_found(error):
-        return jsonify({'success': False, 'error': 'Not found', 'message': str(error)}), 404
-    
-    @app.errorhandler(500)
-    def internal_error(error):
-        db.session.rollback()
-        app.logger.error(f'Server Error: {error}')
-        app.logger.error(traceback.format_exc())
-        return jsonify({'success': False, 'error': 'Internal server error'}), 500
-    
-    # =================== UTILITY ROUTES ===================
+    @app.route('/')
+    def serve_frontend():
+        """Serve the main frontend application"""
+        return send_from_directory(app.static_folder, 'index.html')
     
     @app.route('/api/health', methods=['GET'])
     def health_check():
@@ -79,44 +76,19 @@ def create_app(config_name='development'):
         return jsonify({
             'status': 'healthy',
             'timestamp': datetime.utcnow().isoformat(),
-            'version': '1.0.0'
+            'services_initialized': _services_initialized
         })
     
-    @app.route('/')
-    def serve_index():
-        """Serve the main application"""
-        return send_from_directory('static', 'index.html')
-    
-    @app.route('/<path:filename>')
-    def serve_static(filename):
-        """Serve static files"""
-        return send_from_directory('static', filename)
-    
-    # =================== TAB 1: PROJECTS ===================
+    # =================== PROJECTS ===================
     
     @app.route('/api/projects', methods=['GET'])
     def get_projects():
         """Get all projects"""
         try:
             projects = Project.query.all()
-            project_list = []
-            
-            for project in projects:
-                project_data = {
-                    'id': project.id,
-                    'name': project.name,
-                    'description': project.description,
-                    'status': project.status,
-                    'created_at': project.created_at.isoformat() if project.created_at else None,
-                    'updated_at': project.updated_at.isoformat() if project.updated_at else None,
-                    'sources_count': len(project.sources),
-                    'dictionary_entries_count': len(project.dictionary_entries)
-                }
-                project_list.append(project_data)
-            
             return jsonify({
                 'success': True,
-                'projects': project_list
+                'projects': [project.to_dict() for project in projects]
             })
         except Exception as e:
             app.logger.error(f'Error fetching projects: {str(e)}')
@@ -127,85 +99,43 @@ def create_app(config_name='development'):
         """Create a new project"""
         try:
             data = request.get_json()
-            
             project = Project(
                 name=data['name'],
                 description=data.get('description', ''),
-                owner=data.get('owner', 'default_user'),  # Provide default owner
-                status='active'
+                owner=data.get('owner', 'default_user')
             )
-            
             db.session.add(project)
             db.session.commit()
             
             return jsonify({
                 'success': True,
-                'project': {
-                    'id': project.id,
-                    'name': project.name,
-                    'description': project.description,
-                    'owner': project.owner,
-                    'status': project.status,
-                    'created_at': project.created_at.isoformat(),
-                    'sources_count': 0,
-                    'dictionary_entries_count': 0
-                }
+                'project': project.to_dict()
             })
         except Exception as e:
             db.session.rollback()
             app.logger.error(f'Error creating project: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/projects/<int:project_id>', methods=['PUT'])
-    def update_project(project_id):
-        """Update a project"""
+    @app.route('/api/projects/<int:project_id>', methods=['GET'])
+    def get_project(project_id):
+        """Get a specific project"""
         try:
-            project = Project.query.get_or_404(project_id)
-            data = request.get_json()
-            
-            project.name = data.get('name', project.name)
-            project.description = data.get('description', project.description)
-            project.status = data.get('status', project.status)
-            # Note: owner can be updated if provided, otherwise keep existing
-            if 'owner' in data:
-                project.owner = data['owner']
-            
-            db.session.commit()
+            project = db.session.get(Project, project_id)
+            if not project:
+                return jsonify({'success': False, 'error': 'Project not found'}), 404
             
             return jsonify({
                 'success': True,
-                'project': {
-                    'id': project.id,
-                    'name': project.name,
-                    'description': project.description,
-                    'owner': project.owner,
-                    'status': project.status,
-                    'updated_at': project.updated_at.isoformat()
-                }
+                'project': project.to_dict()
             })
         except Exception as e:
-            db.session.rollback()
-            app.logger.error(f'Error updating project: {str(e)}')
+            app.logger.error(f'Error fetching project: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/projects/<int:project_id>', methods=['DELETE'])
-    def delete_project(project_id):
-        """Delete a project"""
-        try:
-            project = Project.query.get_or_404(project_id)
-            db.session.delete(project)
-            db.session.commit()
-            
-            return jsonify({'success': True})
-        except Exception as e:
-            db.session.rollback()
-            app.logger.error(f'Error deleting project: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
-    
-    # =================== TAB 2: DATA SOURCES ===================
+    # =================== DATA SOURCES ===================
     
     @app.route('/api/projects/<int:project_id>/sources', methods=['GET'])
-    def get_data_sources(project_id):
+    def get_sources(project_id):
         """Get data sources for a project"""
         try:
             sources = DataSource.query.filter_by(project_id=project_id).all()
@@ -217,10 +147,10 @@ def create_app(config_name='development'):
                     'name': source.name,
                     'type': source.type,
                     'subtype': source.subtype,
-                    'status': source.ingest_status,  # Use the actual column but return as 'status'
-                    'file_path': source.file_path,
+                    'ingest_status': source.ingest_status,
                     'created_at': source.created_at.isoformat() if source.created_at else None,
-                    'table_count': len(source.tables)
+                    'row_count': getattr(source, 'row_count', 0),
+                    'file_size_mb': round(getattr(source, 'file_size_bytes', 0) / (1024*1024), 2) if hasattr(source, 'file_size_bytes') else 0
                 }
                 source_list.append(source_data)
             
@@ -229,15 +159,15 @@ def create_app(config_name='development'):
                 'sources': source_list
             })
         except Exception as e:
-            app.logger.error(f'Error fetching data sources: {str(e)}')
+            app.logger.error(f'Error fetching sources: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/projects/<int:project_id>/upload', methods=['POST'])
+    @app.route('/api/projects/<int:project_id>/sources', methods=['POST'])
     def upload_file(project_id):
-        """Upload and process file"""
+        """Upload and process a file"""
         try:
-            # Check if project exists
-            project = Project.query.get(project_id)
+            # Validate project exists
+            project = db.session.get(Project, project_id)
             if not project:
                 return jsonify({
                     'success': False,
@@ -257,72 +187,12 @@ def create_app(config_name='development'):
                     'error': 'No file selected'
                 }), 400
             
-            # Validate file extension
-            allowed_extensions = app.config['ALLOWED_EXTENSIONS']
-            file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+            # Process the file
+            result = data_source_service.process_uploaded_file(file, project_id)
             
-            if file_extension not in allowed_extensions:
-                return jsonify({
-                    'success': False, 
-                    'error': f'Unsupported file type. Allowed: {", ".join(allowed_extensions)}'
-                }), 400
+            return jsonify(result)
             
-            # Save file
-            filename = secure_filename(file.filename)
-            timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            unique_filename = f"{timestamp}_{filename}"
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-            
-            # Ensure upload directory exists
-            os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-            file.save(file_path)
-            
-            # Create data source record
-            source = DataSource(
-                project_id=project_id,
-                name=filename,
-                type='file',
-                subtype=file_extension,
-                file_path=file_path,
-                ingest_status='uploaded'
-            )
-            
-            db.session.add(source)
-            db.session.flush()  # Get the ID
-            
-            try:
-                # Process the file
-                tables_created = data_source_service.process_uploaded_file(source.id, file_path)
-                source.ingest_status = 'processed'
-                
-                db.session.commit()
-                
-                app.logger.info(f"Successfully processed file {filename}, created {tables_created} tables")
-                
-                return jsonify({
-                    'success': True,
-                    'source': {
-                        'id': source.id,
-                        'name': source.name,
-                        'type': source.type,
-                        'subtype': source.subtype,
-                        'status': source.ingest_status,
-                        'tables_created': tables_created
-                    },
-                    'message': f'File processed successfully. Created {tables_created} table(s).'
-                })
-                
-            except Exception as e:
-                source.ingest_status = 'error'
-                db.session.commit()
-                app.logger.error(f'Error processing file: {str(e)}')
-                return jsonify({
-                    'success': False, 
-                    'error': f'Failed to process file: {str(e)}'
-                }), 500
-                
         except Exception as e:
-            db.session.rollback()
             app.logger.error(f'Error uploading file: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
@@ -391,8 +261,8 @@ def create_app(config_name='development'):
         """Get dictionary entries for a project"""
         try:
             entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
-            
             entry_list = []
+            
             for entry in entries:
                 entry_data = {
                     'id': entry.id,
@@ -404,16 +274,15 @@ def create_app(config_name='development'):
                     'abbreviations': entry.abbreviations or [],
                     'status': entry.status,
                     'is_auto_generated': entry.is_auto_generated,
-                    'confidence_score': round(entry.confidence_score, 3) if entry.confidence_score else None,
-                    'created_at': entry.created_at.isoformat() if entry.created_at else None,
-                    'created_by': entry.created_by
+                    'confidence_score': round(float(entry.confidence_score), 3) if entry.confidence_score else None,
+                    'created_by': entry.created_by,
+                    'created_at': entry.created_at.isoformat() if entry.created_at else None
                 }
                 entry_list.append(entry_data)
             
             return jsonify({
                 'success': True,
-                'entries': entry_list,
-                'total_count': len(entry_list)
+                'entries': entry_list
             })
         except Exception as e:
             app.logger.error(f'Error fetching dictionary entries: {str(e)}')
@@ -421,16 +290,9 @@ def create_app(config_name='development'):
     
     @app.route('/api/projects/<int:project_id>/dictionary', methods=['POST'])
     def create_dictionary_entry(project_id):
-        """Create a dictionary entry"""
+        """Create a new dictionary entry"""
         try:
             data = request.get_json()
-            
-            # Validate required fields
-            if not data.get('term') or not data.get('definition'):
-                return jsonify({
-                    'success': False,
-                    'error': 'Term and definition are required'
-                }), 400
             
             entry = DictionaryEntry(
                 project_id=project_id,
@@ -440,9 +302,7 @@ def create_app(config_name='development'):
                 domain=data.get('domain'),
                 synonyms=data.get('synonyms', []),
                 abbreviations=data.get('abbreviations', []),
-                status=data.get('status', 'draft'),
-                is_auto_generated=data.get('is_auto_generated', False),
-                confidence_score=data.get('confidence_score'),
+                status='approved',
                 created_by=data.get('created_by', 'user')
             )
             
@@ -469,7 +329,10 @@ def create_app(config_name='development'):
     def update_dictionary_entry(entry_id):
         """Update a dictionary entry"""
         try:
-            entry = DictionaryEntry.query.get_or_404(entry_id)
+            entry = db.session.get(DictionaryEntry, entry_id)
+            if not entry:
+                return jsonify({'success': False, 'error': 'Entry not found'}), 404
+                
             data = request.get_json()
             
             entry.term = data.get('term', entry.term)
@@ -500,7 +363,10 @@ def create_app(config_name='development'):
     def delete_dictionary_entry(entry_id):
         """Delete a dictionary entry"""
         try:
-            entry = DictionaryEntry.query.get_or_404(entry_id)
+            entry = db.session.get(DictionaryEntry, entry_id)
+            if not entry:
+                return jsonify({'success': False, 'error': 'Entry not found'}), 404
+                
             db.session.delete(entry)
             db.session.commit()
             
@@ -570,7 +436,7 @@ def create_app(config_name='development'):
                     'model_name': emb.model_name,
                     'created_at': emb.created_at.isoformat() if emb.created_at else None
                 })
-            
+         
             return jsonify({
                 'success': True,
                 'total_embeddings': len(embeddings),
@@ -584,6 +450,32 @@ def create_app(config_name='development'):
             app.logger.error(f'Error getting embeddings status: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
+    # ADD MISSING DELETE ENDPOINT FOR EMBEDDINGS
+    @app.route('/api/projects/<int:project_id>/embeddings', methods=['DELETE'])
+    def delete_embeddings(project_id):
+        """Delete embeddings for a project"""
+        try:
+            object_type = request.args.get('object_type')
+            
+            # Validate project exists
+            project = db.session.get(Project, project_id)
+            if not project:
+                return jsonify({
+                    'success': False,
+                    'error': f'Project {project_id} not found'
+                }), 404
+            
+            # Delete embeddings
+            deleted_count = embedding_service.delete_embeddings(project_id, object_type)
+            
+            return jsonify({
+                'success': True,
+                'deleted_count': deleted_count,
+                'message': f'Deleted {deleted_count} embeddings'
+            })
+        except Exception as e:
+            app.logger.error(f'Error deleting embeddings: {str(e)}')
+            return jsonify({'success': False, 'error': str(e)}), 500
     
     @app.route('/api/projects/<int:project_id>/embeddings/batch', methods=['POST'])
     def create_embeddings_batch(project_id):
@@ -594,7 +486,7 @@ def create_app(config_name='development'):
             object_types = data.get('object_types', ['tables', 'columns', 'dictionary'])
             
             # Validate project exists
-            project = Project.query.get(project_id)
+            project = db.session.get(Project, project_id)
             if not project:
                 return jsonify({
                     'success': False,
@@ -616,19 +508,6 @@ def create_app(config_name='development'):
         except Exception as e:
             app.logger.error(f'Error creating embeddings batch: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
-    
-    # @app.route('/api/embeddings/job/<job_id>/status', methods=['GET'])
-    # def get_embedding_job_status(job_id):
-    #     """Get status of embedding job"""
-    #     try:
-    #         status = embedding_service.get_job_status(job_id)
-    #         return jsonify({
-    #             'success': True,
-    #             'status': status
-    #         })
-    #     except Exception as e:
-    #         app.logger.error(f'Error getting job status: {str(e)}')
-    #         return jsonify({'success': False, 'error': str(e)}), 500
     
     @app.route('/api/embeddings/models', methods=['GET'])
     def get_available_models():
@@ -679,14 +558,14 @@ def create_app(config_name='development'):
         try:
             data = request.get_json()
             
-            # Create index record
+            # FIXED: Use object_types instead of object_scope
             index = Index(
                 project_id=project_id,
                 name=data['name'],
                 index_type=data.get('index_type', 'faiss'),
                 embedding_model=data.get('embedding_model'),
-                object_scope=data.get('object_scope', {}),
-                build_params=data.get('build_params', {}),
+                object_types=data.get('object_types', []),  # FIXED: was object_scope
+                config_json=data.get('config_json', {}),    # FIXED: was build_params
                 status='created'
             )
             
@@ -700,20 +579,15 @@ def create_app(config_name='development'):
                 
                 return jsonify({
                     'success': True,
-                    'index': {
-                        'id': index.id,
-                        'name': index.name,
-                        'status': index.status,
-                        'total_vectors': result['total_vectors']
-                    }
+                    'index': index.to_dict(),
+                    'build_result': result
                 })
-                
-            except Exception as e:
+            except Exception as build_error:
                 db.session.rollback()
-                app.logger.error(f'Error building index {index.id}: {str(e)}')
+                app.logger.error(f'Error building index: {str(build_error)}')
                 return jsonify({
-                    'success': False, 
-                    'error': f'Failed to build index: {str(e)}'
+                    'success': False,
+                    'error': f'Index creation failed: {str(build_error)}'
                 }), 500
                 
         except Exception as e:
@@ -723,24 +597,17 @@ def create_app(config_name='development'):
     
     # =================== SEARCH ===================
     
-    @app.route('/api/search', methods=['POST'])
-    def perform_search():
-        """Perform search across indexes"""
+    @app.route('/api/projects/<int:project_id>/search', methods=['POST'])
+    def search_project(project_id):
+        """Search within a project"""
         try:
             data = request.get_json()
-            query = data.get('query')
-            project_id = data.get('project_id')  # Required for search
-            search_params = data.get('search_params', {})
-            
-            if not project_id:
-                return jsonify({
-                    'success': False, 
-                    'error': 'Project ID required for multi-index search'
-                }), 400
+            query = data.get('query', '')
+            search_params = data.get('params', {})
             
             if not query:
                 return jsonify({
-                    'success': False, 
+                    'success': False,
                     'error': 'Query is required'
                 }), 400
             
@@ -749,213 +616,67 @@ def create_app(config_name='development'):
             
             return jsonify({
                 'success': True,
-                'results': results
+                **results
             })
         except Exception as e:
-            app.logger.error(f'Error performing search: {str(e)}')
+            app.logger.error(f'Error searching project {project_id}: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    # =================== TAB 5: CHAT (NL → SQL) ===================
+    # =================== CHAT ===================
     
-    @app.route('/api/chat/entities', methods=['POST'])
-    def extract_entities():
-        """Extract entities from natural language query"""
+    @app.route('/api/projects/<int:project_id>/chat', methods=['POST'])
+    def chat_with_data(project_id):
+        """Chat with project data using NL to SQL"""
         try:
             data = request.get_json()
-            query = data['query']
-            project_id = data['project_id']
+            query = data.get('query', '')
             
-            entities = chat_service.extract_entities(query, project_id)
+            if not query:
+                return jsonify({
+                    'success': False,
+                    'error': 'Query is required'
+                }), 400
+            
+            # Process natural language query
+            result = chat_service.process_query(query, project_id)
             
             return jsonify({
                 'success': True,
-                'entities': entities
+                **result
             })
         except Exception as e:
-            app.logger.error(f'Error extracting entities: {str(e)}')
+            app.logger.error(f'Error processing chat query: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/chat/mapping', methods=['POST'])
-    def map_entities():
-        """Map entities to tables/columns"""
-        try:
-            data = request.get_json()
-            entities = data['entities']
-            project_id = data['project_id']
-            
-            mappings = chat_service.map_entities_to_schema(entities, project_id)
-            
-            return jsonify({
-                'success': True,
-                'mappings': mappings
-            })
-        except Exception as e:
-            app.logger.error(f'Error mapping entities: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
+    # =================== ADMIN ===================
     
-    @app.route('/api/chat/sql', methods=['POST'])
-    def generate_sql():
-        """Generate SQL from natural language query and context"""
+    @app.route('/api/admin/stats', methods=['GET'])
+    def get_admin_stats():
+        """Get system statistics"""
         try:
-            data = request.get_json()
-            query = data['query']
-            entities = data['entities']
-            mappings = data['mappings']
-            project_id = data['project_id']
-            
-            sql_result = chat_service.generate_sql(query, entities, mappings, project_id)
-            
-            return jsonify({
-                'success': True,
-                'sql_result': sql_result
-            })
+            result = admin_service.get_system_stats()
+            return jsonify(result)
         except Exception as e:
-            app.logger.error(f'Error generating SQL: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
-    
-    @app.route('/api/chat/execute', methods=['POST'])
-    def execute_sql():
-        """Execute SQL query safely"""
-        try:
-            data = request.get_json()
-            sql_query = data['sql']
-            project_id = data['project_id']
-            
-            results = chat_service.execute_sql_safely(sql_query, project_id)
-            
-            return jsonify({
-                'success': True,
-                'results': results
-            })
-        except Exception as e:
-            app.logger.error(f'Error executing SQL: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
-    
-    @app.route('/api/chat/answer', methods=['POST'])
-    def generate_answer():
-        """Generate natural language answer from SQL results"""
-        try:
-            data = request.get_json()
-            query = data['query']
-            sql = data['sql']
-            results = data['results']
-            project_id = data['project_id']
-            
-            answer = chat_service.generate_natural_language_answer(
-                query, sql, results, project_id
-            )
-            
-            return jsonify({
-                'success': True,
-                'answer': answer
-            })
-        except Exception as e:
-            app.logger.error(f'Error generating answer: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
-    
-    # =================== TAB 6: ADMIN ===================
-    
-    @app.route('/api/admin/health', methods=['GET'])
-    def get_system_health():
-        """Get system health status"""
-        try:
-            health = admin_service.get_system_health()
-            return jsonify({
-                'success': True,
-                'health': health
-            })
-        except Exception as e:
-            app.logger.error(f'Error getting system health: {str(e)}')
+            app.logger.error(f'Error getting admin stats: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
     @app.route('/api/admin/execute', methods=['POST'])
-    def admin_execute_sql():
-        """Execute SQL query for admin (with safety checks)"""
+    def execute_admin_query():
+        """Execute admin SQL query"""
         try:
             data = request.get_json()
-            sql = data.get('sql', '').strip()
+            query = data.get('query', '')
             
-            if not sql:
+            if not query:
                 return jsonify({
                     'success': False,
-                    'error': 'SQL query is required'
+                    'error': 'Query is required'
                 }), 400
             
-            # Use the admin service to execute safely
-            results = admin_service.execute_sql_query(sql)
-            
-            return jsonify({
-                'success': results['success'],
-                'results': results if results['success'] else None,
-                'error': results.get('error') if not results['success'] else None
-            })
+            result = admin_service.execute_query(query)
+            return jsonify(result)
         except Exception as e:
-            app.logger.error(f'Error executing admin SQL: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
-    
-    @app.route('/api/admin/tables', methods=['GET'])
-    def get_admin_tables():
-        """Get all tables with pagination for admin view"""
-        try:
-            page = request.args.get('page', 1, type=int)
-            per_page = request.args.get('per_page', 10, type=int)
-            
-            # Join tables with sources and projects for complete info
-            tables_query = db.session.query(Table).join(DataSource).join(Project).order_by(Table.created_at.desc())
-            
-            # Paginate
-            try:
-                paginated = tables_query.paginate(
-                    page=page, per_page=per_page, error_out=False
-                )
-            except Exception as e:
-                app.logger.warning(f"Pagination error, using manual pagination: {str(e)}")
-                # Manual pagination fallback
-                offset = (page - 1) * per_page
-                tables = tables_query.offset(offset).limit(per_page).all()
-                total = tables_query.count()
-                
-                # Create manual pagination object
-                class ManualPagination:
-                    def __init__(self, items, page, per_page, total):
-                        self.items = items
-                        self.page = page
-                        self.per_page = per_page
-                        self.total = total
-                        self.pages = (total + per_page - 1) // per_page
-                        self.has_next = page < self.pages
-                        self.has_prev = page > 1
-                
-                paginated = ManualPagination(tables, page, per_page, total)
-            
-            table_list = []
-            for table in paginated.items:
-                table_data = {
-                    'id': table.id,
-                    'name': table.name,
-                    'project_name': table.source.project.name if table.source and table.source.project else 'Unknown',
-                    'source_name': table.source.name if table.source else 'Unknown',
-                    'source_type': table.source.type if table.source else 'Unknown',
-                    'row_count': table.row_count or 0,
-                    'column_count': table.column_count or 0,
-                    'created_at': table.created_at.isoformat() if table.created_at else None
-                }
-                table_list.append(table_data)
-            
-            return jsonify({
-                'success': True,
-                'tables': table_list,
-                'pagination': {
-                    'page': paginated.page,
-                    'pages': paginated.pages,
-                    'per_page': paginated.per_page,
-                    'total': paginated.total,
-                    'has_next': paginated.has_next,
-                    'has_prev': paginated.has_prev
-                }
-            })
-        except Exception as e:
-            app.logger.error(f'Error getting admin tables: {str(e)}')
+            app.logger.error(f'Error executing admin query: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
     @app.route('/api/admin/table/<int:table_id>', methods=['GET'])
@@ -989,7 +710,32 @@ def create_app(config_name='development'):
             return jsonify({'success': False, 'error': str(e)}), 500
 
     # =================== DEBUG ENDPOINTS ===================
+
+    @app.route('/api/debug/info', methods=['GET'])
+    def debug_info():
+        """Debug information endpoint"""
+        try:
+            # Basic counts
+            projects_count = Project.query.count()
+            sources_count = DataSource.query.count()
+            
+            return jsonify({
+                'success': True,
+                'debug_info': {
+                    'services_initialized': _services_initialized,
+                    'projects_count': projects_count,
+                    'sources_count': sources_count,
+                    'config_name': app.config.get('ENV', 'unknown'),
+                    'database_url': str(db.engine.url).split('@')[0] + '@***' if '@' in str(db.engine.url) else str(db.engine.url)
+                }
+            })
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
     
+
     @app.route('/api/debug/embedding-service', methods=['GET'])
     def debug_embedding_service():
         """Debug endpoint to check embedding service status"""
@@ -1058,4 +804,4 @@ def create_app(config_name='development'):
 app = create_app('development')  # Explicitly use development config
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)

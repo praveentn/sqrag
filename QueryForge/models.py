@@ -51,20 +51,16 @@ class DataSource(db.Model):
     type = db.Column(db.String(50), nullable=False)  # file, database, api
     subtype = db.Column(db.String(50))  # csv, excel, postgres, mysql, etc.
     
-    # File-specific fields
-    file_path = db.Column(db.String(500))  # Path to uploaded file
-    file_size = db.Column(db.BigInteger)  # File size in bytes
+    # Connection/file info
+    connection_string = db.Column(Text)  # DB connection or file path
+    file_size_bytes = db.Column(db.BigInteger)
     
-    # Database connection config (stored as JSON)
-    connection_config = db.Column(JSON)
+    # Processing status
+    ingest_status = db.Column(db.String(50), default='pending')  # pending, processing, completed, failed
+    ingest_error = db.Column(Text)
     
-    # API config
-    api_config = db.Column(JSON)
-    
-    # Status and metadata
-    ingest_status = db.Column(db.String(50), default='pending')  # pending, processing, completed, error
-    ingest_progress = db.Column(Numeric(5, 2), default=0.0)  # Progress percentage
-    error_message = db.Column(Text)
+    # Metadata
+    metadata_json = db.Column(JSON)  # Extra metadata specific to source type
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -79,18 +75,16 @@ class DataSource(db.Model):
             'name': self.name,
             'type': self.type,
             'subtype': self.subtype,
-            'file_path': self.file_path,
-            'file_size': self.file_size,
+            'file_size_bytes': self.file_size_bytes,
             'ingest_status': self.ingest_status,
-            'ingest_progress': float(self.ingest_progress) if self.ingest_progress else 0.0,
-            'error_message': self.error_message,
+            'ingest_error': self.ingest_error,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'tables_count': len(self.tables)
         }
 
 class Table(db.Model):
-    """Tables discovered from data sources"""
+    """Tables within data sources"""
     __tablename__ = 'tables'
     
     id = db.Column(db.Integer, primary_key=True)
@@ -169,12 +163,17 @@ class Column(db.Model):
     # Sample data (JSON array)
     sample_values = db.Column(JSON)
     
-    # Data quality and governance
-    pii_flag = db.Column(db.Boolean, default=False)
+    # Data quality and governance - FIXED NAMING
+    pii_flag = db.Column(db.Boolean, default=False)  # FIXED: was is_pii
     sensitivity_level = db.Column(db.String(50))  # low, medium, high, critical
     business_category = db.Column(db.String(100))  # dimension, measure, identifier, etc.
     
+    # Pattern and format info
+    common_patterns = db.Column(JSON)  # Array of common data patterns found
+    data_format = db.Column(db.String(100))  # date format, number format, etc.
+    
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     def to_dict(self):
         return {
@@ -196,39 +195,43 @@ class Column(db.Model):
             'sample_values': self.sample_values,
             'pii_flag': self.pii_flag,
             'sensitivity_level': self.sensitivity_level,
-            'business_category': self.business_category
+            'business_category': self.business_category,
+            'common_patterns': self.common_patterns,
+            'data_format': self.data_format,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
 class DictionaryEntry(db.Model):
-    """Data dictionary entries: terms, definitions, synonyms"""
+    """Business data dictionary entries"""
     __tablename__ = 'dictionary'
     
     id = db.Column(db.Integer, primary_key=True)
     project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
     
-    # Core content
+    # Core definition
     term = db.Column(db.String(255), nullable=False)
     definition = db.Column(Text, nullable=False)
-    category = db.Column(db.String(100))  # business_term, technical_term, abbreviation, etc.
+    category = db.Column(db.String(100))  # business_term, technical_term, metric, dimension
+    domain = db.Column(db.String(100))  # finance, sales, hr, operations, etc.
     
-    # Extended metadata
+    # Alternative representations
     synonyms = db.Column(JSON)  # Array of synonyms
     abbreviations = db.Column(JSON)  # Array of abbreviations
-    related_terms = db.Column(JSON)  # Array of related term IDs
-    domain = db.Column(db.String(100))  # finance, hr, sales, etc.
+    examples = db.Column(JSON)  # Array of example values/usage
     
-    # Versioning and approval
-    version = db.Column(db.Integer, default=1)
-    status = db.Column(db.String(50), default='draft')  # draft, approved, archived
+    # Governance
+    status = db.Column(db.String(50), default='draft')  # draft, approved, deprecated, archived
+    approval_date = db.Column(db.DateTime)
     approved_by = db.Column(db.String(100))
-    approved_at = db.Column(db.DateTime)
     
     # Auto-generation metadata
     is_auto_generated = db.Column(db.Boolean, default=False)
     confidence_score = db.Column(Numeric(5, 3))  # For auto-generated terms
-    source_tables = db.Column(JSON)  # Tables this term was derived from
+    source_tables = db.Column(JSON)  # Tables/columns this term was derived from
     
-    created_by = db.Column(db.String(100))
+    # Lineage and usage
+    created_by = db.Column(db.String(100), default='user')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -239,14 +242,13 @@ class DictionaryEntry(db.Model):
             'term': self.term,
             'definition': self.definition,
             'category': self.category,
+            'domain': self.domain,
             'synonyms': self.synonyms or [],
             'abbreviations': self.abbreviations or [],
-            'related_terms': self.related_terms or [],
-            'domain': self.domain,
-            'version': self.version,
+            'examples': self.examples or [],
             'status': self.status,
+            'approval_date': self.approval_date.isoformat() if self.approval_date else None,
             'approved_by': self.approved_by,
-            'approved_at': self.approved_at.isoformat() if self.approved_at else None,
             'is_auto_generated': self.is_auto_generated,
             'confidence_score': round(float(self.confidence_score), 3) if self.confidence_score else None,
             'source_tables': self.source_tables or [],
@@ -273,7 +275,7 @@ class Embedding(db.Model):
     vector_norm = db.Column(Numeric(precision=10, scale=3))
     
     # Additional metadata
-    emb__metadata = db.Column(JSON)
+    emb__metadata = db.Column(JSON)  # Fixed: using emb__metadata instead of metadata
     
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
@@ -321,10 +323,10 @@ class Index(db.Model):
     description = db.Column(Text)
     index_type = db.Column(db.String(50), nullable=False)  # faiss, tfidf, bm25, etc.
     
-    # Configuration
+    # Configuration - FIXED: Using correct field names
     embedding_model = db.Column(db.String(255))  # Filter embeddings by model
-    object_types = db.Column(JSON)  # Array of object types to include
-    config_json = db.Column(JSON)  # Index-specific configuration
+    object_types = db.Column(JSON)  # Array of object types to include - FIXED: was object_scope
+    config_json = db.Column(JSON)  # Index-specific configuration - FIXED: was build_params
     
     # Status and metrics
     status = db.Column(db.String(50), default='building')  # building, ready, error
@@ -362,70 +364,21 @@ class Index(db.Model):
         }
 
 class SearchLog(db.Model):
-    """Log of search queries and results for analytics"""
+    """Search query logs for analytics"""
     __tablename__ = 'search_logs'
     
     id = db.Column(db.Integer, primary_key=True)
     project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
     
-    # Query info
-    query_text = db.Column(Text, nullable=False)
+    # Query details
+    query = db.Column(Text, nullable=False)
     query_type = db.Column(db.String(50))  # semantic, keyword, hybrid
-    index_id = db.Column(db.Integer, db.ForeignKey('indexes.id'))
     
     # Results
-    results_count = db.Column(db.Integer)
-    top_result_score = db.Column(Numeric(5, 3))
-    results_json = db.Column(JSON)  # Full results for analysis
-    
-    # Performance
+    results_count = db.Column(db.Integer, default=0)
     search_time_ms = db.Column(Numeric(10, 2))
     
-    # User context
-    user_id = db.Column(db.String(100))
-    session_id = db.Column(db.String(255))
-    
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'project_id': self.project_id,
-            'query_text': self.query_text,
-            'query_type': self.query_type,
-            'index_id': self.index_id,
-            'results_count': self.results_count,
-            'top_result_score': round(float(self.top_result_score), 3) if self.top_result_score else None,
-            'search_time_ms': round(float(self.search_time_ms), 2) if self.search_time_ms else None,
-            'user_id': self.user_id,
-            'session_id': self.session_id,
-            'timestamp': self.timestamp.isoformat() if self.timestamp else None
-        }
-
-class NLQFeedback(db.Model):
-    """Natural Language Query feedback and corrections"""
-    __tablename__ = 'nlq_feedback'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
-    
-    # Original query and response
-    natural_query = db.Column(Text, nullable=False)
-    generated_sql = db.Column(Text)
-    sql_results = db.Column(JSON)
-    generated_answer = db.Column(Text)
-    
-    # User feedback
-    feedback_type = db.Column(db.String(50))  # correct, incorrect, partially_correct
-    corrected_sql = db.Column(Text)
-    corrected_answer = db.Column(Text)
-    user_notes = db.Column(Text)
-    
-    # Performance metrics
-    sql_execution_time_ms = db.Column(Numeric(10, 2))
-    total_time_ms = db.Column(Numeric(10, 2))
-    
-    # User context
+    # Context
     user_id = db.Column(db.String(100))
     session_id = db.Column(db.String(255))
     
@@ -435,21 +388,53 @@ class NLQFeedback(db.Model):
         return {
             'id': self.id,
             'project_id': self.project_id,
-            'natural_query': self.natural_query,
-            'generated_sql': self.generated_sql,
-            'generated_answer': self.generated_answer,
-            'feedback_type': self.feedback_type,
-            'corrected_sql': self.corrected_sql,
-            'corrected_answer': self.corrected_answer,
-            'user_notes': self.user_notes,
-            'sql_execution_time_ms': round(float(self.sql_execution_time_ms), 2) if self.sql_execution_time_ms else None,
-            'total_time_ms': round(float(self.total_time_ms), 2) if self.total_time_ms else None,
+            'query': self.query,
+            'query_type': self.query_type,
+            'results_count': self.results_count,
+            'search_time_ms': round(float(self.search_time_ms), 2) if self.search_time_ms else None,
             'user_id': self.user_id,
             'session_id': self.session_id,
             'created_at': self.created_at.isoformat() if self.created_at else None
         }
 
-# Additional helper tables for many-to-many relationships
+class NLQFeedback(db.Model):
+    """Natural Language Query feedback for improving NL to SQL"""
+    __tablename__ = 'nlq_feedback'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    project_id = db.Column(db.Integer, db.ForeignKey('projects.id'), nullable=False)
+    
+    # Query details
+    natural_query = db.Column(Text, nullable=False)
+    generated_sql = db.Column(Text)
+    corrected_sql = db.Column(Text)
+    
+    # Feedback
+    rating = db.Column(db.Integer)  # 1-5 rating
+    feedback_type = db.Column(db.String(50))  # correct, incorrect, partial
+    feedback_text = db.Column(Text)
+    
+    # Metadata
+    execution_time_ms = db.Column(Numeric(10, 2))
+    error_message = db.Column(Text)
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'project_id': self.project_id,
+            'natural_query': self.natural_query,
+            'generated_sql': self.generated_sql,
+            'corrected_sql': self.corrected_sql,
+            'rating': self.rating,
+            'feedback_type': self.feedback_type,
+            'feedback_text': self.feedback_text,
+            'execution_time_ms': round(float(self.execution_time_ms), 2) if self.execution_time_ms else None,
+            'error_message': self.error_message,
+            'created_at': self.created_at.isoformat() if self.created_at else None
+        }
+
 class TableRelationship(db.Model):
     """Track relationships between tables"""
     __tablename__ = 'table_relationships'

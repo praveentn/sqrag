@@ -55,7 +55,7 @@ const DataSourcesTab = ({ projectId, apiUrl, onNotification }) => {
     });
 
     try {
-      const response = await fetch(`${apiUrl}/projects/${projectId}/upload`, {
+      const response = await fetch(`${apiUrl}/projects/${projectId}/sources`, {
         method: 'POST',
         body: formData,
       });
@@ -676,7 +676,7 @@ const TableViewModal = ({ source, apiUrl, onClose, onNotification }) => {
 
   const fetchTables = async () => {
     try {
-      const response = await fetch(`${apiUrl}/sources/${source.id}/tables`);
+      const response = await fetch(`${apiUrl}/projects/${source.id}/tables`);
       if (!response.ok) throw new Error('Failed to fetch tables');
       
       const data = await response.json();

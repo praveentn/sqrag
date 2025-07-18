@@ -141,7 +141,7 @@ def upload_file(project_id: int, file_path: str) -> Dict:
         raise FileNotFoundError(f"File not found: {file_path}")
     
     # For file upload, we need to use a different approach
-    url = f"{API_BASE_URL}/projects/{project_id}/sources/upload"
+    url = f"{API_BASE_URL}/projects/{project_id}/upload"
     
     with open(file_path, 'rb') as f:
         files = {'file': f}

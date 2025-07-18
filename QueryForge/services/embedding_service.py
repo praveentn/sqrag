@@ -72,133 +72,116 @@ class EmbeddingService:
             self.openai_client = None
     
     def create_embeddings_batch(self, project_id: int, model_name: str, 
-                               object_types: List[str]) -> str:
-        """Create embeddings in batch for multiple object types"""
+                             object_types: List[str]) -> str:
+        """Create embeddings in batch for specified object types"""
         job_id = str(uuid.uuid4())
         
-        # Track job status
+        # Initialize job status
         self.job_status[job_id] = {
-            'status': 'running',
+            'status': 'starting',
             'progress': 0.0,
-            'message': 'Starting embedding creation',
-            'created_embeddings': 0,
             'total_objects': 0,
-            'started_at': datetime.utcnow()
+            'processed_objects': 0,
+            'created_embeddings': 0,
+            'message': 'Initializing embedding job',
+            'started_at': datetime.utcnow(),
+            'error': None
         }
         
-        # Start background job with proper Flask context
-        if self.app:
-            thread = threading.Thread(
-                target=self._run_embedding_job_with_context,
-                args=(job_id, project_id, model_name, object_types)
-            )
-        else:
-            thread = threading.Thread(
-                target=self._run_embedding_job,
-                args=(job_id, project_id, model_name, object_types)
-            )
-        
+        # Start background thread
+        thread = threading.Thread(
+            target=self._create_embeddings_worker,
+            args=(job_id, project_id, model_name, object_types)
+        )
         thread.daemon = True
         thread.start()
         
         return job_id
     
-    def _run_embedding_job_with_context(self, job_id: str, project_id: int, 
-                                      model_name: str, object_types: List[str]):
-        """Run embedding job with Flask application context"""
-        with self.app.app_context():
-            self._run_embedding_job(job_id, project_id, model_name, object_types)
-    
-    def get_job_status(self, job_id: str) -> Dict[str, Any]:
-        """Get status of embedding job"""
-        return self.job_status.get(job_id, {
-            'status': 'not_found',
-            'message': 'Job not found'
-        })
-    
-    def _run_embedding_job(self, job_id: str, project_id: int, 
-                          model_name: str, object_types: List[str]):
-        """Run embedding creation job in background"""
+    def _create_embeddings_worker(self, job_id: str, project_id: int, 
+                                model_name: str, object_types: List[str]):
+        """Background worker for creating embeddings"""
         try:
-            self.job_status[job_id]['status'] = 'running'
+            # Update status
+            self.job_status[job_id]['status'] = 'gathering_objects'
+            self.job_status[job_id]['message'] = 'Gathering objects for embedding'
             
-            # Get all objects to embed
-            objects_to_embed = self._get_objects_for_embedding(project_id, object_types)
-            total_objects = len(objects_to_embed)
+            # Get objects to embed
+            objects = self._get_objects_for_embedding(project_id, object_types)
             
-            self.job_status[job_id].update({
-                'total_objects': total_objects,
-                'message': f'Processing {total_objects} objects'
-            })
-            
-            if total_objects == 0:
-                self.job_status[job_id].update({
-                    'status': 'completed',
-                    'progress': 1.0,
-                    'message': 'No objects found to embed',
-                    'completed_at': datetime.utcnow()
-                })
+            if not objects:
+                self.job_status[job_id]['status'] = 'completed'
+                self.job_status[job_id]['message'] = 'No objects found for embedding'
+                self.job_status[job_id]['progress'] = 1.0
                 return
             
+            self.job_status[job_id]['total_objects'] = len(objects)
+            self.job_status[job_id]['status'] = 'creating_embeddings'
+            self.job_status[job_id]['message'] = f'Creating embeddings for {len(objects)} objects'
+            
+            # Create embeddings in batches
+            batch_size = Config.EMBEDDING_CONFIG.get('batch_size', 32)
             created_count = 0
-            batch_size = Config.EMBEDDING_CONFIG['batch_size']
             
-            # Process in batches
-            for i in range(0, total_objects, batch_size):
-                batch = objects_to_embed[i:i + batch_size]
+            for i in range(0, len(objects), batch_size):
+                batch = objects[i:i + batch_size]
                 
-                # Create embeddings for batch
-                batch_embeddings = self._create_embeddings_for_batch(
-                    batch, model_name, project_id
-                )
-                
-                # Save to database
-                for embedding_data in batch_embeddings:
-                    embedding = Embedding(**embedding_data)
-                    db.session.add(embedding)
-                
-                created_count += len(batch_embeddings)
-                
-                # Update progress
-                progress = created_count / total_objects
-                self.job_status[job_id].update({
-                    'progress': round(progress, 3),
-                    'created_embeddings': created_count,
-                    'message': f'Created {created_count}/{total_objects} embeddings'
-                })
-                
-                # Commit batch
                 try:
-                    db.session.commit()
-                    logger.info(f"Committed batch of {len(batch_embeddings)} embeddings")
-                except Exception as e:
-                    logger.error(f"Error committing embeddings batch: {str(e)}")
-                    db.session.rollback()
-                    raise
+                    batch_embeddings = self._create_embeddings_for_batch(
+                        batch, model_name, project_id
+                    )
+                    created_count += len(batch_embeddings)
+                    
+                    # Update progress
+                    processed = min(i + batch_size, len(objects))
+                    progress = processed / len(objects)
+                    
+                    self.job_status[job_id]['processed_objects'] = processed
+                    self.job_status[job_id]['created_embeddings'] = created_count
+                    self.job_status[job_id]['progress'] = progress
+                    self.job_status[job_id]['message'] = f'Processed {processed}/{len(objects)} objects'
+                    
+                except Exception as batch_error:
+                    logger.warning(f"Error processing batch {i}: {str(batch_error)}")
+                    continue
             
-            # Job completed
-            self.job_status[job_id].update({
-                'status': 'completed',
-                'progress': 1.0,
-                'message': f'Successfully created {created_count} embeddings',
-                'completed_at': datetime.utcnow()
-            })
+            # Complete
+            self.job_status[job_id]['status'] = 'completed'
+            self.job_status[job_id]['progress'] = 1.0
+            self.job_status[job_id]['message'] = f'Successfully created {created_count} embeddings'
+            self.job_status[job_id]['completed_at'] = datetime.utcnow()
+            
+            logger.info(f"Embedding job {job_id} completed: {created_count} embeddings created")
             
         except Exception as e:
             logger.error(f"Embedding job {job_id} failed: {str(e)}")
-            self.job_status[job_id].update({
-                'status': 'failed',
-                'message': f'Job failed: {str(e)}',
-                'error': str(e),
-                'failed_at': datetime.utcnow()
-            })
-            try:
-                db.session.rollback()
-            except:
-                pass  # Session might not be available
+            self.job_status[job_id]['status'] = 'failed'
+            self.job_status[job_id]['error'] = str(e)
+            self.job_status[job_id]['message'] = f'Job failed: {str(e)}'
+    
+    def get_job_status(self, job_id: str) -> Dict[str, Any]:
+        """Get status of an embedding job"""
+        if job_id not in self.job_status:
+            return {
+                'status': 'not_found',
+                'message': f'Job {job_id} not found'
+            }
+        
+        status = self.job_status[job_id].copy()
+        
+        # Add duration if job is running or completed
+        if 'started_at' in status:
+            if status['status'] == 'completed' and 'completed_at' in status:
+                duration = (status['completed_at'] - status['started_at']).total_seconds()
+            else:
+                duration = (datetime.utcnow() - status['started_at']).total_seconds()
+            
+            status['duration_seconds'] = round(duration, 2)
+        
+        return status
     
     def _get_objects_for_embedding(self, project_id: int, object_types: List[str]) -> List[Dict]:
-        """Get all objects that need embeddings"""
+        """Get objects that need embeddings"""
         objects = []
         
         # Clean up existing embeddings for selected object types
@@ -312,8 +295,18 @@ class EmbeddingService:
         
         # Add sample values for context
         if column.sample_values:
-            sample_text = ', '.join(str(v) for v in column.sample_values[:5])
-            parts.append(f"Examples: {sample_text}")
+            # Handle both JSON string and list formats
+            if isinstance(column.sample_values, str):
+                try:
+                    sample_values = json.loads(column.sample_values)
+                except:
+                    sample_values = [column.sample_values]
+            else:
+                sample_values = column.sample_values
+            
+            if sample_values:
+                sample_text = ', '.join(str(v) for v in sample_values[:5])
+                parts.append(f"Examples: {sample_text}")
         
         return ' '.join(parts)
     
@@ -337,76 +330,99 @@ class EmbeddingService:
         """Create embeddings for a batch of objects"""
         texts = [obj['text'] for obj in batch]
         
-        # Generate embeddings based on model type
-        if model_name.startswith('sentence-transformers/'):
-            vectors = self._create_sentence_transformer_embeddings(texts, model_name)
-        elif model_name.startswith('openai/'):
-            vectors = self._create_openai_embeddings(texts, model_name)
+        # Create embeddings
+        if model_name.startswith('openai/'):
+            embeddings = self._create_openai_embeddings(texts, model_name)
         else:
-            raise ValueError(f"Unsupported embedding model: {model_name}")
+            embeddings = self._create_sentence_transformer_embeddings(texts, model_name)
         
-        # Create embedding records
-        embeddings = []
-        for i, obj in enumerate(batch):
-            vector = vectors[i]
-            
-            embedding_data = {
-                'project_id': project_id,
-                'object_type': obj['object_type'],
-                'object_id': obj['object_id'],
-                'object_text': obj['text'][:1000],  # Limit text length
-                'model_name': model_name,
-                'vector_dimension': len(vector),
-                'vector': pickle.dumps(vector),  # Serialize vector
-                'vector_norm': round(float(np.linalg.norm(vector)), 3),
-                'metadata': json.dumps(obj.get('metadata', {})),
-                'created_at': datetime.utcnow()
-            }
-            embeddings.append(embedding_data)
+        # Save to database
+        created_embeddings = []
+        for i, (obj, embedding_vector) in enumerate(zip(batch, embeddings)):
+            try:
+                # Calculate vector norm
+                vector_norm = np.linalg.norm(embedding_vector) if embedding_vector is not None else 0
+                
+                embedding = Embedding(
+                    project_id=project_id,
+                    object_type=obj['object_type'],
+                    object_id=obj['object_id'],
+                    object_text=obj['text'],
+                    model_name=model_name,
+                    vector_dimension=len(embedding_vector) if embedding_vector is not None else 0,
+                    vector_norm=round(float(vector_norm), 3),
+                    emb__metadata=json.dumps(obj['metadata'])
+                )
+                
+                if embedding_vector is not None:
+                    embedding.set_vector(embedding_vector)
+                
+                db.session.add(embedding)
+                created_embeddings.append(embedding)
+                
+            except Exception as e:
+                logger.warning(f"Error creating embedding for object {obj['object_id']}: {str(e)}")
+                continue
         
-        return embeddings
+        db.session.commit()
+        return created_embeddings
     
-    def _create_sentence_transformer_embeddings(self, texts: List[str], model_name: str) -> np.ndarray:
+    def _create_sentence_transformer_embeddings(self, texts: List[str], model_name: str) -> List[np.ndarray]:
         """Create embeddings using sentence transformers"""
         if not self.sentence_model:
-            raise ValueError("Sentence transformer not available")
+            raise ValueError("Sentence transformer model not available")
         
-        # Load specific model if different from default
-        if model_name != Config.EMBEDDING_CONFIG['default_model']:
-            model = SentenceTransformer(model_name.replace('sentence-transformers/', ''))
-        else:
-            model = self.sentence_model
-        
-        # Create embeddings
-        embeddings = model.encode(texts, batch_size=Config.EMBEDDING_CONFIG['batch_size'])
-        return embeddings
+        try:
+            # Load specific model if different from default
+            if model_name != Config.EMBEDDING_CONFIG['default_model']:
+                if model_name not in self.embedding_models:
+                    self.embedding_models[model_name] = SentenceTransformer(model_name)
+                model = self.embedding_models[model_name]
+            else:
+                model = self.sentence_model
+            
+            # Create embeddings
+            embeddings = model.encode(texts, convert_to_numpy=True)
+            return [emb.astype('float32') for emb in embeddings]
+            
+        except Exception as e:
+            logger.error(f"Error creating sentence transformer embeddings: {str(e)}")
+            raise
     
-    def _create_openai_embeddings(self, texts: List[str], model_name: str) -> List[List[float]]:
+    def _create_openai_embeddings(self, texts: List[str], model_name: str) -> List[np.ndarray]:
         """Create embeddings using OpenAI API"""
         if not self.openai_client:
             raise ValueError("OpenAI client not available")
         
-        embeddings = []
-        
-        # Process in smaller batches for API limits
-        batch_size = 10
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
+        try:
+            # Clean model name
+            clean_model_name = model_name.replace('openai/', '')
             
-            response = self.openai_client.embeddings.create(
-                input=batch_texts,
-                model=model_name.replace('openai/', '')
-            )
+            # Process in smaller batches for OpenAI
+            embeddings = []
+            batch_size = 20  # OpenAI recommended batch size
             
-            batch_embeddings = [data.embedding for data in response.data]
-            embeddings.extend(batch_embeddings)
-        
-        return embeddings
+            for i in range(0, len(texts), batch_size):
+                batch_texts = texts[i:i + batch_size]
+                
+                response = self.openai_client.embeddings.create(
+                    input=batch_texts,
+                    model=clean_model_name
+                )
+                
+                batch_embeddings = [data.embedding for data in response.data]
+                embeddings.extend(batch_embeddings)
+            
+            return [np.array(emb, dtype='float32') for emb in embeddings]
+            
+        except Exception as e:
+            logger.error(f"Error creating OpenAI embeddings: {str(e)}")
+            raise
     
     def build_index(self, index_id: int) -> Dict[str, Any]:
         """Build search index from embeddings"""
         try:
-            index_record = Index.query.get(index_id)
+            index_record = db.session.get(Index, index_id)
             if not index_record:
                 raise ValueError(f"Index {index_id} not found")
             
@@ -455,7 +471,7 @@ class EmbeddingService:
                 'total_vectors': len(embeddings),
                 'index_type': index_record.index_type
             }
-            
+       
         except Exception as e:
             logger.error(f"Error building index {index_id}: {str(e)}")
             
@@ -482,14 +498,20 @@ class EmbeddingService:
         
         results = []
         for emb in embeddings:
-            results.append({
-                'id': emb.id,
-                'object_type': emb.object_type,
-                'object_id': emb.object_id,
-                'text': emb.object_text,
-                'vector': pickle.loads(emb.vector),
-                'metadata': json.loads(emb.metadata) if emb.metadata else {}
-            })
+            try:
+                vector = emb.get_vector()
+                if vector is not None:
+                    results.append({
+                        'id': emb.id,
+                        'object_type': emb.object_type,
+                        'object_id': emb.object_id,
+                        'text': emb.object_text,
+                        'vector': vector,
+                        'metadata': json.loads(emb.emb__metadata) if emb.emb__metadata else {}
+                    })
+            except Exception as e:
+                logger.warning(f"Error processing embedding {emb.id}: {str(e)}")
+                continue
         
         return results
     
@@ -505,10 +527,18 @@ class EmbeddingService:
         faiss.normalize_L2(vectors)
         index.add(vectors)
         
+        # Prepare metadata
+        metadata = {
+            'embedding_ids': [emb['id'] for emb in embeddings],
+            'object_types': [emb['object_type'] for emb in embeddings],
+            'object_ids': [emb['object_id'] for emb in embeddings],
+            'object_texts': [emb['text'] for emb in embeddings]
+        }
+        
         return {
             'type': 'faiss',
             'index': index,
-            'embeddings': embeddings,
+            'metadata': metadata,
             'dimension': dimension
         }
     
@@ -524,78 +554,71 @@ class EmbeddingService:
         
         tfidf_matrix = vectorizer.fit_transform(texts)
         
+        # Prepare metadata
+        metadata = {
+            'embedding_ids': [emb['id'] for emb in embeddings],
+            'object_types': [emb['object_type'] for emb in embeddings],
+            'object_ids': [emb['object_id'] for emb in embeddings],
+            'object_texts': [emb['text'] for emb in embeddings]
+        }
+        
         return {
             'type': 'tfidf',
             'vectorizer': vectorizer,
             'matrix': tfidf_matrix,
-            'embeddings': embeddings
+            'metadata': metadata
         }
     
     def _build_bm25_index(self, embeddings: List[Dict], index_record: Index) -> Dict:
-        """Build BM25 index from embeddings"""
-        # Simple BM25 implementation using CountVectorizer
-        texts = [emb['text'] for emb in embeddings]
-        
-        vectorizer = CountVectorizer(
-            max_features=10000,
-            stop_words='english',
-            ngram_range=(1, 2)
-        )
-        
-        count_matrix = vectorizer.fit_transform(texts)
-        
-        return {
-            'type': 'bm25',
-            'vectorizer': vectorizer,
-            'matrix': count_matrix,
-            'embeddings': embeddings
-        }
+        """Build BM25 index (similar to TF-IDF)"""
+        return self._build_tfidf_index(embeddings, index_record)
     
     def _save_index_files(self, index_id: int, index_data: Dict) -> Dict[str, str]:
         """Save index files to disk"""
-        index_dir = f"indexes/{index_id}"
+        index_dir = os.path.join('indexes', str(index_id))
         os.makedirs(index_dir, exist_ok=True)
         
-        index_path = f"{index_dir}/index.pkl"
-        metadata_path = f"{index_dir}/metadata.json"
+        paths = {}
         
-        # Save index data
         if index_data['type'] == 'faiss':
-            faiss_path = f"{index_dir}/faiss.index"
+            # Save FAISS index
+            faiss_path = os.path.join(index_dir, 'index.faiss')
             faiss.write_index(index_data['index'], faiss_path)
-            index_data['faiss_path'] = faiss_path
-            del index_data['index']  # Remove non-serializable object
+            
+            # Save complete index data (without FAISS object)
+            index_copy = index_data.copy()
+            index_copy['faiss_path'] = faiss_path
+            del index_copy['index']  # Remove FAISS object for pickling
+            
+            index_path = os.path.join(index_dir, 'index.pkl')
+            with open(index_path, 'wb') as f:
+                pickle.dump(index_copy, f)
+            
+            paths['index'] = index_path
+            
+        else:
+            # Save other index types
+            index_path = os.path.join(index_dir, 'index.pkl')
+            with open(index_path, 'wb') as f:
+                pickle.dump(index_data, f)
+            
+            paths['index'] = index_path
         
-        with open(index_path, 'wb') as f:
-            pickle.dump(index_data, f)
-        
-        # Save metadata
-        metadata = {
-            'index_id': index_id,
-            'type': index_data['type'],
-            'dimension': index_data.get('dimension'),
-            'total_vectors': len(index_data['embeddings']),
-            'created_at': datetime.utcnow().isoformat()
-        }
-        
+        # Save metadata separately
+        metadata_path = os.path.join(index_dir, 'metadata.json')
         with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(index_data['metadata'], f, indent=2)
         
-        return {
-            'index': index_path,
-            'metadata': metadata_path
-        }
+        paths['metadata'] = metadata_path
+        
+        return paths
     
-    def load_index(self, index_id: int) -> Dict[str, Any]:
+    def load_index(self, index_id: int) -> Dict:
         """Load index from disk"""
         try:
-            # Check if already cached
-            if index_id in self.indexes:
-                return self.indexes[index_id]
-            
-            index_record = Index.query.get(index_id)
-            if not index_record or index_record.status != 'ready':
-                raise ValueError(f"Index {index_id} not ready")
+            index_record = db.session.get(Index, index_id)
+            if not index_record or not index_record.index_file_path:
+                raise ValueError(f"Index {index_id} not found or no file path")
             
             # Load index data
             with open(index_record.index_file_path, 'rb') as f:
@@ -648,6 +671,7 @@ class EmbeddingService:
             query.delete()
             db.session.commit()
             
+            logger.info(f"Deleted {count} embeddings for project {project_id}")
             return count
             
         except Exception as e:

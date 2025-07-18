@@ -266,7 +266,7 @@ PUT    /api/projects/{id}         # Update project
 DELETE /api/projects/{id}         # Delete project
 
 # Data Sources
-POST   /api/sources/upload        # Upload file
+POST   /api/upload        # Upload file
 POST   /api/sources/database      # Connect database
 GET    /api/sources/{id}/schema   # Get schema info
 GET    /api/sources/{id}/preview  # Preview data

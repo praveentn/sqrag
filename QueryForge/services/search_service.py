@@ -54,7 +54,7 @@ class SearchService:
             raise ValueError("Project ID required for search")
         
         # Validate project exists
-        project = Project.query.get(project_id)
+        project = db.session.get(Project, project_id)
         if not project:
             raise ValueError(f"Project {project_id} not found")
         
@@ -230,170 +230,235 @@ class SearchService:
         if not all_results:
             return []
         
-        # Group by object to avoid duplicates
-        object_groups = {}
+        # Group by object_id and object_type to deduplicate
+        unique_results = {}
         for result in all_results:
             key = f"{result['object_type']}_{result['object_id']}"
-            if key not in object_groups:
-                object_groups[key] = []
-            object_groups[key].append(result)
+            if key not in unique_results or result['score'] > unique_results[key]['score']:
+                unique_results[key] = result
         
-        # Take best score for each object
-        merged_results = []
-        for object_key, results in object_groups.items():
-            best_result = max(results, key=lambda x: x['score'])
-            
-            # Add information about multiple matches
-            if len(results) > 1:
-                best_result['match_count'] = len(results)
-                best_result['search_types'] = list(set(r['search_type'] for r in results))
-            
-            merged_results.append(best_result)
-        
-        # Sort by score and limit
+        # Convert back to list and sort by score
+        merged_results = list(unique_results.values())
         merged_results.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Update ranks
+        for i, result in enumerate(merged_results):
+            result['rank'] = i + 1
+        
         return merged_results[:top_k]
     
-    def _log_search(self, query: str, project_id: int, result_count: int, search_time: float):
-        """Log search query for analytics"""
+    def _log_search(self, query: str, project_id: int, results_count: int, search_time: float):
+        """Log search for analytics"""
         try:
             search_log = SearchLog(
                 project_id=project_id,
                 query=query,
-                result_count=result_count,
-                search_time_seconds=round(search_time, 3),
-                timestamp=datetime.utcnow()
+                results_count=results_count,
+                search_time_ms=round(search_time * 1000, 2),
+                created_at=datetime.utcnow()
             )
             db.session.add(search_log)
             db.session.commit()
         except Exception as e:
-            logger.warning(f"Failed to log search: {str(e)}")
-            db.session.rollback()
+            logger.warning(f"Error logging search: {str(e)}")
     
-    def get_search_suggestions(self, query: str, project_id: int, limit: int = 5) -> List[str]:
-        """Get search suggestions based on dictionary and previous searches"""
-        suggestions = []
-        
+    def get_similar_objects(self, object_type: str, object_id: int, 
+                          project_id: int, top_k: int = 5) -> List[Dict]:
+        """Find objects similar to a given object"""
         try:
-            # Get dictionary terms that match
-            dictionary_matches = DictionaryEntry.query.filter(
-                DictionaryEntry.project_id == project_id,
-                DictionaryEntry.term.ilike(f'%{query}%')
-            ).limit(limit).all()
+            # Get the embedding for the target object
+            target_embedding = Embedding.query.filter_by(
+                project_id=project_id,
+                object_type=object_type,
+                object_id=object_id
+            ).first()
             
-            suggestions.extend([entry.term for entry in dictionary_matches])
+            if not target_embedding:
+                return []
             
-            # Get popular searches
-            if len(suggestions) < limit:
-                popular_searches = db.session.query(SearchLog.query)\
-                    .filter(SearchLog.project_id == project_id)\
-                    .filter(SearchLog.query.ilike(f'%{query}%'))\
-                    .group_by(SearchLog.query)\
-                    .order_by(db.func.count(SearchLog.query).desc())\
-                    .limit(limit - len(suggestions))\
-                    .all()
+            # Use the object text as query
+            return self.search(
+                target_embedding.object_text, 
+                project_id, 
+                {'top_k': top_k + 1}  # +1 to exclude self
+            )['results'][1:]  # Exclude the first result (self)
+            
+        except Exception as e:
+            logger.error(f"Error finding similar objects: {str(e)}")
+            return []
+    
+    def search_by_category(self, category: str, project_id: int, 
+                         top_k: int = 10) -> List[Dict]:
+        """Search for objects by category"""
+        try:
+            # Get all objects of the specified category
+            if category == 'tables':
+                tables = db.session.query(Table).join(
+                    Table.source
+                ).filter(
+                    Table.source.has(project_id=project_id)
+                ).all()
                 
-                suggestions.extend([log.query for log in popular_searches])
+                results = []
+                for table in tables:
+                    results.append({
+                        'object_type': 'table',
+                        'object_id': table.id,
+                        'text': table.name,
+                        'score': 1.0,
+                        'metadata': {
+                            'name': table.name,
+                            'row_count': table.row_count,
+                            'column_count': table.column_count
+                        }
+                    })
+                
+            elif category == 'columns':
+                columns = db.session.query(Column).join(
+                    Column.table
+                ).join(
+                    Table.source
+                ).filter(
+                    Table.source.has(project_id=project_id)
+                ).all()
+                
+                results = []
+                for column in columns:
+                    results.append({
+                        'object_type': 'column',
+                        'object_id': column.id,
+                        'text': column.name,
+                        'score': 1.0,
+                        'metadata': {
+                            'name': column.name,
+                            'table_name': column.table.name,
+                            'data_type': column.data_type,
+                            'business_category': column.business_category
+                        }
+                    })
+                
+            elif category == 'dictionary':
+                entries = DictionaryEntry.query.filter_by(
+                    project_id=project_id
+                ).filter(
+                    DictionaryEntry.status != 'archived'
+                ).all()
+                
+                results = []
+                for entry in entries:
+                    results.append({
+                        'object_type': 'dictionary_entry',
+                        'object_id': entry.id,
+                        'text': entry.term,
+                        'score': 1.0,
+                        'metadata': {
+                            'term': entry.term,
+                            'definition': entry.definition,
+                            'category': entry.category,
+                            'domain': entry.domain
+                        }
+                    })
+            else:
+                results = []
             
-            return suggestions[:limit]
+            return results[:top_k]
+            
+        except Exception as e:
+            logger.error(f"Error searching by category: {str(e)}")
+            return []
+    
+    def get_search_suggestions(self, partial_query: str, project_id: int, 
+                             max_suggestions: int = 5) -> List[str]:
+        """Get search suggestions based on partial query"""
+        try:
+            suggestions = set()
+            partial_lower = partial_query.lower()
+            
+            # Get table names
+            tables = db.session.query(Table).join(
+                Table.source
+            ).filter(
+                Table.source.has(project_id=project_id)
+            ).all()
+            
+            for table in tables:
+                if partial_lower in table.name.lower():
+                    suggestions.add(table.name)
+            
+            # Get column names
+            columns = db.session.query(Column).join(
+                Column.table
+            ).join(
+                Table.source
+            ).filter(
+                Table.source.has(project_id=project_id)
+            ).all()
+            
+            for column in columns:
+                if partial_lower in column.name.lower():
+                    suggestions.add(column.name)
+            
+            # Get dictionary terms
+            entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
+            for entry in entries:
+                if partial_lower in entry.term.lower():
+                    suggestions.add(entry.term)
+            
+            return sorted(list(suggestions))[:max_suggestions]
             
         except Exception as e:
             logger.error(f"Error getting search suggestions: {str(e)}")
-            return suggestions
+            return []
     
-    def get_search_analytics(self, project_id: int, days: int = 30) -> Dict[str, Any]:
-        """Get search analytics for a project"""
+    def get_search_stats(self, project_id: int, days: int = 30) -> Dict[str, Any]:
+        """Get search statistics for a project"""
         try:
-            from sqlalchemy import func
-            from datetime import datetime, timedelta
+            from datetime import timedelta
             
             cutoff_date = datetime.utcnow() - timedelta(days=days)
             
-            # Basic stats
-            total_searches = SearchLog.query.filter(
+            # Get search logs
+            logs = SearchLog.query.filter(
                 SearchLog.project_id == project_id,
-                SearchLog.timestamp >= cutoff_date
-            ).count()
+                SearchLog.created_at >= cutoff_date
+            ).all()
             
-            # Average results and search time
-            avg_stats = db.session.query(
-                func.avg(SearchLog.result_count).label('avg_results'),
-                func.avg(SearchLog.search_time_seconds).label('avg_time')
-            ).filter(
-                SearchLog.project_id == project_id,
-                SearchLog.timestamp >= cutoff_date
-            ).first()
+            if not logs:
+                return {
+                    'total_searches': 0,
+                    'avg_search_time': 0,
+                    'avg_results_count': 0,
+                    'popular_queries': [],
+                    'search_trends': []
+                }
             
-            # Top queries
-            top_queries = db.session.query(
-                SearchLog.query,
-                func.count(SearchLog.query).label('count')
-            ).filter(
-                SearchLog.project_id == project_id,
-                SearchLog.timestamp >= cutoff_date
-            ).group_by(SearchLog.query)\
-            .order_by(func.count(SearchLog.query).desc())\
-            .limit(10).all()
+            # Calculate statistics
+            total_searches = len(logs)
+            avg_search_time = sum(log.search_time_ms for log in logs) / total_searches
+            avg_results_count = sum(log.results_count for log in logs) / total_searches
             
-            # Search volume by day
-            daily_volume = db.session.query(
-                func.date(SearchLog.timestamp).label('date'),
-                func.count(SearchLog.id).label('count')
-            ).filter(
-                SearchLog.project_id == project_id,
-                SearchLog.timestamp >= cutoff_date
-            ).group_by(func.date(SearchLog.timestamp))\
-            .order_by(func.date(SearchLog.timestamp)).all()
+            # Popular queries
+            query_counts = {}
+            for log in logs:
+                query_counts[log.query] = query_counts.get(log.query, 0) + 1
+            
+            popular_queries = sorted(query_counts.items(), 
+                                   key=lambda x: x[1], reverse=True)[:10]
             
             return {
                 'total_searches': total_searches,
-                'avg_results': round(float(avg_stats.avg_results or 0), 2),
-                'avg_search_time': round(float(avg_stats.avg_time or 0), 3),
-                'top_queries': [{'query': q.query, 'count': q.count} for q in top_queries],
-                'daily_volume': [{'date': str(d.date), 'count': d.count} for d in daily_volume],
+                'avg_search_time': round(avg_search_time, 2),
+                'avg_results_count': round(avg_results_count, 1),
+                'popular_queries': [{'query': q, 'count': c} for q, c in popular_queries],
                 'period_days': days
             }
             
         except Exception as e:
-            logger.error(f"Error getting search analytics: {str(e)}")
+            logger.error(f"Error getting search stats: {str(e)}")
             return {
                 'total_searches': 0,
-                'avg_results': 0,
                 'avg_search_time': 0,
-                'top_queries': [],
-                'daily_volume': [],
-                'period_days': days
+                'avg_results_count': 0,
+                'popular_queries': [],
+                'error': str(e)
             }
-    
-    def clear_index_cache(self, index_id: Optional[int] = None):
-        """Clear cached indexes"""
-        if index_id:
-            self.loaded_indexes.pop(index_id, None)
-        else:
-            self.loaded_indexes.clear()
-        logger.info(f"Cleared index cache for index {index_id if index_id else 'all'}")
-    
-    def get_available_indexes(self, project_id: int) -> List[Dict[str, Any]]:
-        """Get list of available indexes for a project"""
-        try:
-            indexes = Index.query.filter_by(project_id=project_id).all()
-            
-            result = []
-            for index in indexes:
-                index_info = {
-                    'id': index.id,
-                    'name': index.name,
-                    'index_type': index.index_type,
-                    'status': index.status,
-                    'total_vectors': index.total_vectors,
-                    'embedding_model': index.embedding_model,
-                    'created_at': index.created_at.isoformat() if index.created_at else None,
-                    'build_progress': index.build_progress
-                }
-                result.append(index_info)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error getting available indexes: {str(e)}")
-            return []
