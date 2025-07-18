@@ -55,7 +55,7 @@ const DataSourcesTab = ({ projectId, apiUrl, onNotification }) => {
     });
 
     try {
-      const response = await fetch(`${apiUrl}/projects/${projectId}/sources/upload`, {
+      const response = await fetch(`${apiUrl}/projects/${projectId}/upload`, {
         method: 'POST',
         body: formData,
       });

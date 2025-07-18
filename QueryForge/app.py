@@ -50,6 +50,10 @@ def create_app(config_name='development'):
         chat_service = ChatService()
         admin_service = AdminService()
     
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
+    app.logger.setLevel(logging.INFO)
+
     # =================== ERROR HANDLERS ===================
     
     @app.errorhandler(400)
@@ -105,8 +109,8 @@ def create_app(config_name='development'):
                     'status': project.status,
                     'created_at': project.created_at.isoformat() if project.created_at else None,
                     'updated_at': project.updated_at.isoformat() if project.updated_at else None,
-                    'sources_count': project.sources,
-                    'dictionary_entries_count': project.dictionary_entries
+                    'sources_count': len(project.sources),
+                    'dictionary_entries_count': len(project.dictionary_entries)
                 }
                 project_list.append(project_data)
             
@@ -228,20 +232,34 @@ def create_app(config_name='development'):
             app.logger.error(f'Error fetching data sources: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/projects/<int:project_id>/sources/upload', methods=['POST'])
+    @app.route('/api/projects/<int:project_id>/upload', methods=['POST'])
     def upload_file(project_id):
-        """Upload a file data source"""
+        """Upload and process file"""
         try:
+            # Check if project exists
+            project = Project.query.get(project_id)
+            if not project:
+                return jsonify({
+                    'success': False,
+                    'error': f'Project {project_id} not found'
+                }), 404
+            
             if 'file' not in request.files:
-                return jsonify({'success': False, 'error': 'No file provided'}), 400
+                return jsonify({
+                    'success': False,
+                    'error': 'No file provided'
+                }), 400
             
             file = request.files['file']
             if file.filename == '':
-                return jsonify({'success': False, 'error': 'No file selected'}), 400
+                return jsonify({
+                    'success': False,
+                    'error': 'No file selected'
+                }), 400
             
-            # Validate file type
-            allowed_extensions = {'csv', 'xlsx', 'xls', 'json'}
-            file_extension = file.filename.rsplit('.', 1)[1].lower()
+            # Validate file extension
+            allowed_extensions = app.config['ALLOWED_EXTENSIONS']
+            file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
             
             if file_extension not in allowed_extensions:
                 return jsonify({
@@ -254,6 +272,9 @@ def create_app(config_name='development'):
             timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
             unique_filename = f"{timestamp}_{filename}"
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            
+            # Ensure upload directory exists
+            os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
             file.save(file_path)
             
             # Create data source record
@@ -263,7 +284,7 @@ def create_app(config_name='development'):
                 type='file',
                 subtype=file_extension,
                 file_path=file_path,
-                ingest_status='uploaded'  # Use the correct column name
+                ingest_status='uploaded'
             )
             
             db.session.add(source)
@@ -272,9 +293,11 @@ def create_app(config_name='development'):
             try:
                 # Process the file
                 tables_created = data_source_service.process_uploaded_file(source.id, file_path)
-                source.ingest_status = 'processed'  # Use correct column name
+                source.ingest_status = 'processed'
                 
                 db.session.commit()
+                
+                app.logger.info(f"Successfully processed file {filename}, created {tables_created} tables")
                 
                 return jsonify({
                     'success': True,
@@ -283,13 +306,14 @@ def create_app(config_name='development'):
                         'name': source.name,
                         'type': source.type,
                         'subtype': source.subtype,
-                        'status': source.ingest_status,  # Return as 'status' for API consistency
+                        'status': source.ingest_status,
                         'tables_created': tables_created
-                    }
+                    },
+                    'message': f'File processed successfully. Created {tables_created} table(s).'
                 })
                 
             except Exception as e:
-                source.ingest_status = 'error'  # Use correct column name
+                source.ingest_status = 'error'
                 db.session.commit()
                 app.logger.error(f'Error processing file: {str(e)}')
                 return jsonify({
@@ -367,8 +391,8 @@ def create_app(config_name='development'):
         """Get dictionary entries for a project"""
         try:
             entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
-            entry_list = []
             
+            entry_list = []
             for entry in entries:
                 entry_data = {
                     'id': entry.id,
@@ -376,11 +400,11 @@ def create_app(config_name='development'):
                     'definition': entry.definition,
                     'category': entry.category,
                     'domain': entry.domain,
-                    'synonyms': entry.synonyms,
-                    'abbreviations': entry.abbreviations,
+                    'synonyms': entry.synonyms or [],
+                    'abbreviations': entry.abbreviations or [],
                     'status': entry.status,
                     'is_auto_generated': entry.is_auto_generated,
-                    'confidence_score': entry.confidence_score,
+                    'confidence_score': round(entry.confidence_score, 3) if entry.confidence_score else None,
                     'created_at': entry.created_at.isoformat() if entry.created_at else None,
                     'created_by': entry.created_by
                 }
@@ -388,7 +412,8 @@ def create_app(config_name='development'):
             
             return jsonify({
                 'success': True,
-                'entries': entry_list
+                'entries': entry_list,
+                'total_count': len(entry_list)
             })
         except Exception as e:
             app.logger.error(f'Error fetching dictionary entries: {str(e)}')
@@ -399,6 +424,13 @@ def create_app(config_name='development'):
         """Create a dictionary entry"""
         try:
             data = request.get_json()
+            
+            # Validate required fields
+            if not data.get('term') or not data.get('definition'):
+                return jsonify({
+                    'success': False,
+                    'error': 'Term and definition are required'
+                }), 400
             
             entry = DictionaryEntry(
                 project_id=project_id,
@@ -411,7 +443,7 @@ def create_app(config_name='development'):
                 status=data.get('status', 'draft'),
                 is_auto_generated=data.get('is_auto_generated', False),
                 confidence_score=data.get('confidence_score'),
-                created_by=data.get('created_by')
+                created_by=data.get('created_by', 'user')
             )
             
             db.session.add(entry)
@@ -425,7 +457,8 @@ def create_app(config_name='development'):
                     'definition': entry.definition,
                     'category': entry.category,
                     'status': entry.status
-                }
+                },
+                'message': 'Dictionary entry created successfully'
             })
         except Exception as e:
             db.session.rollback()
@@ -492,7 +525,20 @@ def create_app(config_name='development'):
             return jsonify({'success': False, 'error': str(e)}), 500
     
     # =================== TAB 4: EMBEDDINGS ===================
-    
+
+    @app.route('/api/embeddings/job/<job_id>/status', methods=['GET'])
+    def get_embedding_job_status(job_id):
+        """Get status of embedding job"""
+        try:
+            status = embedding_service.get_job_status(job_id)
+            return jsonify({
+                'success': True,
+                'status': status
+            })
+        except Exception as e:
+            app.logger.error(f'Error getting job status: {str(e)}')
+            return jsonify({'success': False, 'error': str(e)}), 500
+
     @app.route('/api/projects/<int:project_id>/embeddings', methods=['GET'])
     def get_embeddings_status(project_id):
         """Get embeddings status for a project"""
@@ -514,17 +560,30 @@ def create_app(config_name='development'):
                     object_type_counts[embedding.object_type] = 0
                 object_type_counts[embedding.object_type] += 1
             
+            # Return embeddings list as well for debugging
+            embeddings_list = []
+            for emb in embeddings[:50]:  # Limit to first 50 for performance
+                embeddings_list.append({
+                    'id': emb.id,
+                    'object_type': emb.object_type,
+                    'object_id': emb.object_id,
+                    'model_name': emb.model_name,
+                    'created_at': emb.created_at.isoformat() if emb.created_at else None
+                })
+            
             return jsonify({
                 'success': True,
                 'total_embeddings': len(embeddings),
                 'models_used': len(model_counts),
                 'object_types': len(object_type_counts),
                 'model_breakdown': model_counts,
-                'object_type_breakdown': object_type_counts
+                'object_type_breakdown': object_type_counts,
+                'embeddings': embeddings_list  # For debugging
             })
         except Exception as e:
             app.logger.error(f'Error getting embeddings status: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
+    
     
     @app.route('/api/projects/<int:project_id>/embeddings/batch', methods=['POST'])
     def create_embeddings_batch(project_id):
@@ -534,6 +593,14 @@ def create_app(config_name='development'):
             model_name = data.get('model_name', 'sentence-transformers/all-MiniLM-L6-v2')
             object_types = data.get('object_types', ['tables', 'columns', 'dictionary'])
             
+            # Validate project exists
+            project = Project.query.get(project_id)
+            if not project:
+                return jsonify({
+                    'success': False,
+                    'error': f'Project {project_id} not found'
+                }), 404
+            
             # Start background job
             job_id = embedding_service.create_embeddings_batch(
                 project_id, model_name, object_types
@@ -542,24 +609,26 @@ def create_app(config_name='development'):
             return jsonify({
                 'success': True,
                 'job_id': job_id,
-                'message': 'Embedding creation started'
+                'message': 'Embedding creation started',
+                'model_name': model_name,
+                'object_types': object_types
             })
         except Exception as e:
             app.logger.error(f'Error creating embeddings batch: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/embeddings/job/<job_id>/status', methods=['GET'])
-    def get_embedding_job_status(job_id):
-        """Get status of embedding job"""
-        try:
-            status = embedding_service.get_job_status(job_id)
-            return jsonify({
-                'success': True,
-                'status': status
-            })
-        except Exception as e:
-            app.logger.error(f'Error getting job status: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
+    # @app.route('/api/embeddings/job/<job_id>/status', methods=['GET'])
+    # def get_embedding_job_status(job_id):
+    #     """Get status of embedding job"""
+    #     try:
+    #         status = embedding_service.get_job_status(job_id)
+    #         return jsonify({
+    #             'success': True,
+    #             'status': status
+    #         })
+    #     except Exception as e:
+    #         app.logger.error(f'Error getting job status: {str(e)}')
+    #         return jsonify({'success': False, 'error': str(e)}), 500
     
     @app.route('/api/embeddings/models', methods=['GET'])
     def get_available_models():
@@ -799,6 +868,31 @@ def create_app(config_name='development'):
             app.logger.error(f'Error getting system health: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
+    @app.route('/api/admin/execute', methods=['POST'])
+    def admin_execute_sql():
+        """Execute SQL query for admin (with safety checks)"""
+        try:
+            data = request.get_json()
+            sql = data.get('sql', '').strip()
+            
+            if not sql:
+                return jsonify({
+                    'success': False,
+                    'error': 'SQL query is required'
+                }), 400
+            
+            # Use the admin service to execute safely
+            results = admin_service.execute_sql_query(sql)
+            
+            return jsonify({
+                'success': results['success'],
+                'results': results if results['success'] else None,
+                'error': results.get('error') if not results['success'] else None
+            })
+        except Exception as e:
+            app.logger.error(f'Error executing admin SQL: {str(e)}')
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
     @app.route('/api/admin/tables', methods=['GET'])
     def get_admin_tables():
         """Get all tables with pagination for admin view"""
@@ -806,23 +900,45 @@ def create_app(config_name='development'):
             page = request.args.get('page', 1, type=int)
             per_page = request.args.get('per_page', 10, type=int)
             
-            tables_query = db.session.query(Table).join(DataSource).join(Project)
+            # Join tables with sources and projects for complete info
+            tables_query = db.session.query(Table).join(DataSource).join(Project).order_by(Table.created_at.desc())
             
             # Paginate
-            paginated = tables_query.paginate(
-                page=page, per_page=per_page, error_out=False
-            )
+            try:
+                paginated = tables_query.paginate(
+                    page=page, per_page=per_page, error_out=False
+                )
+            except Exception as e:
+                app.logger.warning(f"Pagination error, using manual pagination: {str(e)}")
+                # Manual pagination fallback
+                offset = (page - 1) * per_page
+                tables = tables_query.offset(offset).limit(per_page).all()
+                total = tables_query.count()
+                
+                # Create manual pagination object
+                class ManualPagination:
+                    def __init__(self, items, page, per_page, total):
+                        self.items = items
+                        self.page = page
+                        self.per_page = per_page
+                        self.total = total
+                        self.pages = (total + per_page - 1) // per_page
+                        self.has_next = page < self.pages
+                        self.has_prev = page > 1
+                
+                paginated = ManualPagination(tables, page, per_page, total)
             
             table_list = []
             for table in paginated.items:
                 table_data = {
                     'id': table.id,
                     'name': table.name,
-                    'project_name': table.source.project.name,
-                    'source_name': table.source.name,
-                    'source_type': table.source.type,
-                    'row_count': table.row_count,
-                    'column_count': table.column_count
+                    'project_name': table.source.project.name if table.source and table.source.project else 'Unknown',
+                    'source_name': table.source.name if table.source else 'Unknown',
+                    'source_type': table.source.type if table.source else 'Unknown',
+                    'row_count': table.row_count or 0,
+                    'column_count': table.column_count or 0,
+                    'created_at': table.created_at.isoformat() if table.created_at else None
                 }
                 table_list.append(table_data)
             
@@ -830,9 +946,9 @@ def create_app(config_name='development'):
                 'success': True,
                 'tables': table_list,
                 'pagination': {
-                    'page': page,
+                    'page': paginated.page,
                     'pages': paginated.pages,
-                    'per_page': per_page,
+                    'per_page': paginated.per_page,
                     'total': paginated.total,
                     'has_next': paginated.has_next,
                     'has_prev': paginated.has_prev
@@ -842,31 +958,91 @@ def create_app(config_name='development'):
             app.logger.error(f'Error getting admin tables: {str(e)}')
             return jsonify({'success': False, 'error': str(e)}), 500
     
-    @app.route('/api/admin/execute', methods=['POST'])
-    def admin_execute_sql():
-        """Execute SQL query for admin (with safety checks)"""
+    @app.route('/api/admin/table/<int:table_id>', methods=['GET'])
+    def get_admin_table_details(table_id):
+        """Get detailed information about a table"""
         try:
-            data = request.get_json()
-            sql = data['sql']
-            
-            # Safety check - only allow SELECT statements
-            sql_upper = sql.strip().upper()
-            if not sql_upper.startswith('SELECT'):
-                return jsonify({
-                    'success': False,
-                    'error': 'Only SELECT statements are allowed'
-                }), 400
-            
-            results = admin_service.execute_sql_query(sql)
+            result = admin_service.get_table_details(table_id)
+            return jsonify(result)
+        except Exception as e:
+            app.logger.error(f'Error getting table details: {str(e)}')
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    @app.route('/api/admin/schema', methods=['GET'])
+    def get_admin_schema():
+        """Get complete database schema"""
+        try:
+            result = admin_service.get_database_schema()
+            return jsonify(result)
+        except Exception as e:
+            app.logger.error(f'Error getting schema: {str(e)}')
+            return jsonify({'success': False, 'error': str(e)}), 500
+    
+    @app.route('/api/admin/cleanup', methods=['POST'])
+    def admin_cleanup():
+        """Clean up orphaned data"""
+        try:
+            result = admin_service.cleanup_orphaned_data()
+            return jsonify(result)
+        except Exception as e:
+            app.logger.error(f'Error during cleanup: {str(e)}')
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # =================== DEBUG ENDPOINTS ===================
+    
+    @app.route('/api/debug/embedding-service', methods=['GET'])
+    def debug_embedding_service():
+        """Debug endpoint to check embedding service status"""
+        try:
+            models = embedding_service.get_available_models()
+            job_statuses = embedding_service.job_status
             
             return jsonify({
                 'success': True,
-                'results': results
+                'available_models': models,
+                'active_jobs': len(job_statuses),
+                'job_statuses': job_statuses,
+                'sentence_model_loaded': embedding_service.sentence_model is not None,
+                'openai_client_available': embedding_service.openai_client is not None
             })
         except Exception as e:
-            app.logger.error(f'Error executing admin SQL: {str(e)}')
-            return jsonify({'success': False, 'error': str(e)}), 500
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
     
+    @app.route('/api/debug/database', methods=['GET'])
+    def debug_database():
+        """Debug endpoint to check database status"""
+        try:
+            # Test basic queries
+            projects_count = Project.query.count()
+            tables_count = Table.query.count()
+            columns_count = Column.query.count()
+            embeddings_count = Embedding.query.count()
+            dictionary_count = DictionaryEntry.query.count()
+            
+            # Test a simple join
+            tables_with_sources = db.session.query(Table).join(DataSource).count()
+            
+            return jsonify({
+                'success': True,
+                'counts': {
+                    'projects': projects_count,
+                    'tables': tables_count,
+                    'columns': columns_count,
+                    'embeddings': embeddings_count,
+                    'dictionary_entries': dictionary_count,
+                    'tables_with_sources': tables_with_sources
+                },
+                'database_url': str(db.engine.url).replace(str(db.engine.url).split('@')[0].split('://')[-1] + '@', '***@') if '@' in str(db.engine.url) else str(db.engine.url)
+            })
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+
     # =================== DATABASE INITIALIZATION ===================
     
     with app.app_context():

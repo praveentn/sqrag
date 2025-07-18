@@ -170,6 +170,7 @@ class EmbeddingService:
                 # Commit batch
                 try:
                     db.session.commit()
+                    logger.info(f"Committed batch of {len(batch_embeddings)} embeddings")
                 except Exception as e:
                     logger.error(f"Error committing embeddings batch: {str(e)}")
                     db.session.rollback()
@@ -199,6 +200,17 @@ class EmbeddingService:
     def _get_objects_for_embedding(self, project_id: int, object_types: List[str]) -> List[Dict]:
         """Get all objects that need embeddings"""
         objects = []
+        
+        # Clean up existing embeddings for selected object types
+        for object_type in object_types:
+            existing = Embedding.query.filter_by(
+                project_id=project_id,
+                object_type=object_type
+            ).delete()
+            if existing > 0:
+                logger.info(f"Removed {existing} existing {object_type} embeddings")
+        
+        db.session.commit()
         
         if 'tables' in object_types:
             tables = db.session.query(Table).join(
@@ -261,6 +273,7 @@ class EmbeddingService:
                     }
                 })
         
+        logger.info(f"Found {len(objects)} objects to embed for project {project_id}")
         return objects
     
     def _build_table_text(self, table: Table) -> str:
@@ -345,7 +358,9 @@ class EmbeddingService:
                 'model_name': model_name,
                 'vector_dimension': len(vector),
                 'vector': pickle.dumps(vector),  # Serialize vector
-                'vector_norm': round(float(np.linalg.norm(vector)), 3)
+                'vector_norm': round(float(np.linalg.norm(vector)), 3),
+                'metadata': json.dumps(obj.get('metadata', {})),
+                'created_at': datetime.utcnow()
             }
             embeddings.append(embedding_data)
         
@@ -455,10 +470,9 @@ class EmbeddingService:
         """Get embeddings that should be included in the index"""
         query = Embedding.query.filter_by(project_id=index_record.project_id)
         
-        # Filter by object scope if specified
-        object_scope = index_record.object_scope or {}
-        if 'object_types' in object_scope:
-            query = query.filter(Embedding.object_type.in_(object_scope['object_types']))
+        # Filter by object types if specified
+        if index_record.object_types:
+            query = query.filter(Embedding.object_type.in_(index_record.object_types))
         
         # Filter by embedding model if specified
         if index_record.embedding_model:
@@ -466,169 +480,106 @@ class EmbeddingService:
         
         embeddings = query.all()
         
-        # Convert to dict format with deserialized vectors
-        embedding_data = []
+        results = []
         for emb in embeddings:
-            try:
-                vector = pickle.loads(emb.vector)
-                embedding_data.append({
-                    'id': emb.id,
-                    'object_type': emb.object_type,
-                    'object_id': emb.object_id,
-                    'object_text': emb.object_text,
-                    'vector': vector,
-                    'metadata': {
-                        'model_name': emb.model_name,
-                        'vector_dimension': emb.vector_dimension,
-                        'vector_norm': emb.vector_norm
-                    }
-                })
-            except Exception as e:
-                logger.warning(f"Error deserializing embedding {emb.id}: {str(e)}")
-                continue
+            results.append({
+                'id': emb.id,
+                'object_type': emb.object_type,
+                'object_id': emb.object_id,
+                'text': emb.object_text,
+                'vector': pickle.loads(emb.vector),
+                'metadata': json.loads(emb.metadata) if emb.metadata else {}
+            })
         
-        return embedding_data
+        return results
     
-    def _build_faiss_index(self, embeddings: List[Dict], index_record: Index) -> Dict[str, Any]:
-        """Build FAISS index for vector similarity search"""
-        vectors = np.array([emb['vector'] for emb in embeddings]).astype('float32')
+    def _build_faiss_index(self, embeddings: List[Dict], index_record: Index) -> Dict:
+        """Build FAISS index from embeddings"""
+        vectors = np.array([emb['vector'] for emb in embeddings])
         dimension = vectors.shape[1]
         
-        # Choose FAISS index type based on configuration
-        index_type = index_record.build_params.get('index_type', 'IndexFlatIP')
+        # Create FAISS index
+        index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
         
-        if index_type == 'IndexFlatIP':
-            # Inner product for cosine similarity (normalize vectors first)
-            faiss.normalize_L2(vectors)
-            index = faiss.IndexFlatIP(dimension)
-        elif index_type == 'IndexFlatL2':
-            # L2 distance
-            index = faiss.IndexFlatL2(dimension)
-        elif index_type == 'IndexIVFFlat':
-            # IVF for larger datasets
-            nlist = min(100, len(embeddings) // 10)  # Number of clusters
-            quantizer = faiss.IndexFlatL2(dimension)
-            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
-            index.train(vectors)
-        else:
-            raise ValueError(f"Unsupported FAISS index type: {index_type}")
-        
-        # Add vectors to index
+        # Normalize vectors for cosine similarity
+        faiss.normalize_L2(vectors)
         index.add(vectors)
-        
-        # Build metadata mapping
-        metadata = {
-            'embedding_ids': [emb['id'] for emb in embeddings],
-            'object_types': [emb['object_type'] for emb in embeddings],
-            'object_ids': [emb['object_id'] for emb in embeddings],
-            'object_texts': [emb['object_text'] for emb in embeddings],
-            'dimension': dimension,
-            'total_vectors': len(embeddings),
-            'index_type': index_type
-        }
         
         return {
             'type': 'faiss',
             'index': index,
-            'metadata': metadata
+            'embeddings': embeddings,
+            'dimension': dimension
         }
     
-    def _build_tfidf_index(self, embeddings: List[Dict], index_record: Index) -> Dict[str, Any]:
-        """Build TF-IDF index for text similarity search"""
-        texts = [emb['object_text'] for emb in embeddings]
-        
-        # Configure TF-IDF
-        max_features = index_record.build_params.get('max_features', 10000)
-        ngram_range = tuple(index_record.build_params.get('ngram_range', [1, 2]))
+    def _build_tfidf_index(self, embeddings: List[Dict], index_record: Index) -> Dict:
+        """Build TF-IDF index from embeddings"""
+        texts = [emb['text'] for emb in embeddings]
         
         vectorizer = TfidfVectorizer(
-            max_features=max_features,
-            ngram_range=ngram_range,
+            max_features=10000,
             stop_words='english',
-            lowercase=True
+            ngram_range=(1, 2)
         )
         
-        # Fit and transform texts
         tfidf_matrix = vectorizer.fit_transform(texts)
-        
-        metadata = {
-            'embedding_ids': [emb['id'] for emb in embeddings],
-            'object_types': [emb['object_type'] for emb in embeddings],
-            'object_ids': [emb['object_id'] for emb in embeddings],
-            'object_texts': [emb['object_text'] for emb in embeddings],
-            'vocabulary_size': len(vectorizer.vocabulary_),
-            'total_documents': len(texts)
-        }
         
         return {
             'type': 'tfidf',
             'vectorizer': vectorizer,
             'matrix': tfidf_matrix,
-            'metadata': metadata
+            'embeddings': embeddings
         }
     
-    def _build_bm25_index(self, embeddings: List[Dict], index_record: Index) -> Dict[str, Any]:
-        """Build BM25 index (simplified using TF-IDF with BM25-like parameters)"""
-        texts = [emb['object_text'] for emb in embeddings]
+    def _build_bm25_index(self, embeddings: List[Dict], index_record: Index) -> Dict:
+        """Build BM25 index from embeddings"""
+        # Simple BM25 implementation using CountVectorizer
+        texts = [emb['text'] for emb in embeddings]
         
-        # Use binary term frequency (similar to BM25)
-        vectorizer = TfidfVectorizer(
+        vectorizer = CountVectorizer(
             max_features=10000,
-            ngram_range=(1, 2),
             stop_words='english',
-            lowercase=True,
-            binary=True,  # Binary term frequency
-            sublinear_tf=True  # Use log normalization
+            ngram_range=(1, 2)
         )
         
-        matrix = vectorizer.fit_transform(texts)
-        
-        metadata = {
-            'embedding_ids': [emb['id'] for emb in embeddings],
-            'object_types': [emb['object_type'] for emb in embeddings],
-            'object_ids': [emb['object_id'] for emb in embeddings],
-            'object_texts': [emb['object_text'] for emb in embeddings],
-            'vocabulary_size': len(vectorizer.vocabulary_)
-        }
+        count_matrix = vectorizer.fit_transform(texts)
         
         return {
             'type': 'bm25',
             'vectorizer': vectorizer,
-            'matrix': matrix,
-            'metadata': metadata
+            'matrix': count_matrix,
+            'embeddings': embeddings
         }
     
-    def _save_index_files(self, index_id: int, index_data: Dict[str, Any]) -> Dict[str, str]:
-        """Save index and metadata files"""
-        index_dir = os.path.join('indexes', str(index_id))
+    def _save_index_files(self, index_id: int, index_data: Dict) -> Dict[str, str]:
+        """Save index files to disk"""
+        index_dir = f"indexes/{index_id}"
         os.makedirs(index_dir, exist_ok=True)
         
-        index_path = os.path.join(index_dir, 'index.pkl')
-        metadata_path = os.path.join(index_dir, 'metadata.json')
+        index_path = f"{index_dir}/index.pkl"
+        metadata_path = f"{index_dir}/metadata.json"
         
-        # Save based on index type
+        # Save index data
         if index_data['type'] == 'faiss':
-            faiss_path = os.path.join(index_dir, 'faiss.index')
+            faiss_path = f"{index_dir}/faiss.index"
             faiss.write_index(index_data['index'], faiss_path)
-            
-            # Save serializable parts
-            serializable_data = {
-                'type': 'faiss',
-                'faiss_path': faiss_path,
-                'metadata': index_data['metadata']
-            }
-            
-            with open(index_path, 'wb') as f:
-                pickle.dump(serializable_data, f)
+            index_data['faiss_path'] = faiss_path
+            del index_data['index']  # Remove non-serializable object
         
-        else:
-            # For TF-IDF and BM25, save the whole structure
-            with open(index_path, 'wb') as f:
-                pickle.dump(index_data, f)
+        with open(index_path, 'wb') as f:
+            pickle.dump(index_data, f)
         
         # Save metadata
+        metadata = {
+            'index_id': index_id,
+            'type': index_data['type'],
+            'dimension': index_data.get('dimension'),
+            'total_vectors': len(index_data['embeddings']),
+            'created_at': datetime.utcnow().isoformat()
+        }
+        
         with open(metadata_path, 'w') as f:
-            json.dump(index_data['metadata'], f, indent=2)
+            json.dump(metadata, f, indent=2)
         
         return {
             'index': index_path,
@@ -636,16 +587,17 @@ class EmbeddingService:
         }
     
     def load_index(self, index_id: int) -> Dict[str, Any]:
-        """Load index from files"""
-        if index_id in self.indexes:
-            return self.indexes[index_id]
-        
-        index_record = Index.query.get(index_id)
-        if not index_record or index_record.status != 'ready':
-            raise ValueError(f"Index {index_id} not ready")
-        
+        """Load index from disk"""
         try:
-            # Load from file
+            # Check if already cached
+            if index_id in self.indexes:
+                return self.indexes[index_id]
+            
+            index_record = Index.query.get(index_id)
+            if not index_record or index_record.status != 'ready':
+                raise ValueError(f"Index {index_id} not ready")
+            
+            # Load index data
             with open(index_record.index_file_path, 'rb') as f:
                 index_data = pickle.load(f)
             

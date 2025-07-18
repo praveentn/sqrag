@@ -1,576 +1,477 @@
 # services/dictionary_service.py
-import re
-import json
 import logging
-from typing import Dict, List, Any, Optional, Set, Tuple
-from collections import Counter, defaultdict
-import openai
-from openai import AzureOpenAI
+import re
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+from collections import Counter
+import json
 
-from config import Config
 from models import db, Project, Table, Column, DictionaryEntry, DataSource
+from config import Config
 
 logger = logging.getLogger(__name__)
 
 class DictionaryService:
-    """Service for managing data dictionary and auto-generating terms"""
+    """Service for managing data dictionary entries and auto-generation"""
     
     def __init__(self):
-        self._init_llm_client()
-        self.common_abbreviations = self._load_common_abbreviations()
-        self.business_keywords = self._load_business_keywords()
+        # Common business terms that we can auto-detect
+        self.business_patterns = {
+            'customer': ['customer', 'client', 'user', 'account_holder'],
+            'revenue': ['revenue', 'sales', 'income', 'earnings'],
+            'transaction': ['transaction', 'payment', 'order', 'purchase'],
+            'product': ['product', 'item', 'sku', 'inventory'],
+            'date': ['date', 'timestamp', 'created_at', 'updated_at'],
+            'amount': ['amount', 'total', 'sum', 'value', 'price', 'cost'],
+            'quantity': ['quantity', 'count', 'number', 'qty'],
+            'status': ['status', 'state', 'flag', 'active', 'enabled'],
+            'identifier': ['id', 'key', 'reference', 'ref', 'code']
+        }
         
-    def _init_llm_client(self):
-        """Initialize Azure OpenAI client"""
-        try:
-            llm_config = Config.LLM_CONFIG['azure']
-            self.client = AzureOpenAI(
-                api_key=llm_config['api_key'],
-                api_version=llm_config['api_version'],
-                azure_endpoint=llm_config['endpoint']
-            )
-            self.deployment_name = llm_config['deployment_name']
-            logger.info("Azure OpenAI client initialized for dictionary service")
-        except Exception as e:
-            logger.error(f"Failed to initialize Azure OpenAI client: {str(e)}")
-            self.client = None
+        # Domain-specific patterns
+        self.domain_patterns = {
+            'finance': ['balance', 'credit', 'debit', 'interest', 'principal', 'loan'],
+            'hr': ['employee', 'salary', 'department', 'manager', 'position'],
+            'sales': ['lead', 'opportunity', 'quote', 'commission', 'territory'],
+            'marketing': ['campaign', 'conversion', 'impression', 'click', 'engagement'],
+            'operations': ['inventory', 'warehouse', 'shipment', 'logistics', 'supply']
+        }
     
-    def generate_suggestions(self, project_id: int) -> Dict[str, Any]:
-        """Generate comprehensive dictionary suggestions for a project"""
+    def generate_suggestions(self, project_id: int) -> List[Dict[str, Any]]:
+        """Generate dictionary suggestions from project data"""
         try:
-            project = Project.query.get(project_id)
-            if not project:
-                raise ValueError(f"Project {project_id} not found")
+            suggestions = []
             
-            # Collect all textual data from the project
-            project_data = self._collect_project_data(project_id)
-            
-            suggestions = {
-                'business_terms': [],
-                'technical_terms': [],
-                'abbreviations': [],
-                'domain_terms': {}
-            }
-            
-            # Generate different types of suggestions
-            suggestions['business_terms'] = self._generate_business_terms(project_data)
-            suggestions['technical_terms'] = self._generate_technical_terms(project_data)
-            suggestions['abbreviations'] = self._generate_abbreviations(project_data)
-            suggestions['domain_terms'] = self._generate_domain_terms(project_data)
-            
-            # Enhance suggestions with AI if available
-            if self.client:
-                suggestions = self._enhance_suggestions_with_ai(suggestions, project_data)
-            
-            # Filter and rank suggestions
-            suggestions = self._filter_and_rank_suggestions(suggestions, project_id)
-            
-            logger.info(f"Generated {self._count_suggestions(suggestions)} suggestions for project {project_id}")
-            return suggestions
-            
-        except Exception as e:
-            logger.error(f"Error generating dictionary suggestions: {str(e)}")
-            return {
-                'business_terms': [],
-                'technical_terms': [],
-                'abbreviations': [],
-                'domain_terms': {},
-                'error': str(e)
-            }
-    
-    def _collect_project_data(self, project_id: int) -> Dict[str, Any]:
-        """Collect all relevant textual data from the project"""
-        try:
-            # Get tables and columns
+            # Get all tables and columns for the project
             tables = db.session.query(Table).join(DataSource).filter(
                 DataSource.project_id == project_id
             ).all()
             
-            columns = db.session.query(Column).join(Table).join(DataSource).filter(
-                DataSource.project_id == project_id
-            ).all()
+            # Analyze column names and generate suggestions
+            for table in tables:
+                table_suggestions = self._analyze_table_for_terms(table)
+                suggestions.extend(table_suggestions)
             
-            # Collect existing dictionary terms
-            existing_terms = DictionaryEntry.query.filter_by(
-                project_id=project_id
-            ).all()
+            # Remove duplicates and rank by confidence
+            unique_suggestions = self._deduplicate_suggestions(suggestions)
+            ranked_suggestions = sorted(unique_suggestions, 
+                                      key=lambda x: x['confidence_score'], 
+                                      reverse=True)
             
-            data = {
-                'table_names': [table.name for table in tables],
-                'table_display_names': [table.display_name for table in tables if table.display_name],
-                'table_descriptions': [table.description for table in tables if table.description],
-                'column_names': [col.name for col in columns],
-                'column_display_names': [col.display_name for col in columns if col.display_name],
-                'column_descriptions': [col.description for col in columns if col.description],
-                'business_categories': [col.business_category for col in columns if col.business_category],
-                'sample_values': [],
-                'existing_terms': [term.term for term in existing_terms],
-                'data_types': list(set(col.data_type for col in columns if col.data_type))
-            }
-            
-            # Collect sample values
-            for col in columns:
-                if col.sample_values:
-                    data['sample_values'].extend([str(val) for val in col.sample_values[:3]])
-            
-            return data
+            return ranked_suggestions[:50]  # Return top 50 suggestions
             
         except Exception as e:
-            logger.error(f"Error collecting project data: {str(e)}")
-            return {}
+            logger.error(f"Error generating dictionary suggestions: {str(e)}")
+            raise
     
-    def _generate_business_terms(self, project_data: Dict) -> List[Dict[str, Any]]:
-        """Generate business term suggestions"""
+    def _analyze_table_for_terms(self, table: Table) -> List[Dict[str, Any]]:
+        """Analyze a table and generate term suggestions"""
         suggestions = []
         
-        # Extract business terms from table names
-        for table_name in project_data.get('table_names', []):
-            terms = self._extract_business_terms_from_text(table_name)
-            for term in terms:
-                suggestions.append({
-                    'term': term,
-                    'auto_definition': f'Business entity or concept related to {table_name}',
-                    'category': 'business_term',
-                    'confidence': 0.7,
-                    'context': f'Derived from table: {table_name}',
-                    'suggested_domain': self._infer_domain(table_name),
-                    'suggested_synonyms': self._find_synonyms(term)
-                })
+        # Analyze table name
+        table_suggestions = self._extract_terms_from_name(
+            table.name, 'table', table.id, table.name
+        )
+        suggestions.extend(table_suggestions)
         
-        # Extract from column names
-        for col_name in project_data.get('column_names', []):
-            terms = self._extract_business_terms_from_text(col_name)
-            for term in terms:
-                suggestions.append({
-                    'term': term,
-                    'auto_definition': f'Data attribute or field representing {term}',
-                    'category': 'business_term',
-                    'confidence': 0.6,
-                    'context': f'Derived from column: {col_name}',
-                    'suggested_domain': self._infer_domain(col_name),
-                    'suggested_synonyms': self._find_synonyms(term)
-                })
-        
-        # Extract from business categories
-        for category in project_data.get('business_categories', []):
-            if category:
-                suggestions.append({
-                    'term': category.replace('_', ' ').title(),
-                    'auto_definition': f'Business category or classification',
-                    'category': 'business_term',
-                    'confidence': 0.8,
-                    'context': f'Business category: {category}',
-                    'suggested_domain': category,
-                    'suggested_synonyms': []
-                })
-        
-        return self._deduplicate_suggestions(suggestions)
-    
-    def _generate_technical_terms(self, project_data: Dict) -> List[Dict[str, Any]]:
-        """Generate technical term suggestions"""
-        suggestions = []
-        
-        # Data types as technical terms
-        for data_type in project_data.get('data_types', []):
-            if data_type and data_type.upper() not in ['VARCHAR', 'TEXT', 'INTEGER', 'FLOAT']:
-                suggestions.append({
-                    'term': data_type,
-                    'auto_definition': f'Data type used in database schema',
-                    'category': 'technical_term',
-                    'confidence': 0.9,
-                    'context': f'Database data type',
-                    'suggested_domain': 'database',
-                    'suggested_synonyms': []
-                })
-        
-        # Technical patterns in column names
-        technical_patterns = [
-            r'.*_id$', r'.*_key$', r'.*_ref$', r'.*_code$',
-            r'.*_timestamp$', r'.*_date$', r'.*_flag$'
-        ]
-        
-        for col_name in project_data.get('column_names', []):
-            for pattern in technical_patterns:
-                if re.match(pattern, col_name, re.IGNORECASE):
-                    term_type = pattern.split('_')[-1].replace('$', '')
-                    suggestions.append({
-                        'term': f'{term_type.title()} Field',
-                        'auto_definition': f'Technical field type: {term_type}',
-                        'category': 'technical_term',
-                        'confidence': 0.7,
-                        'context': f'Pattern found in: {col_name}',
-                        'suggested_domain': 'database',
-                        'suggested_synonyms': []
-                    })
-        
-        return self._deduplicate_suggestions(suggestions)
-    
-    def _generate_abbreviations(self, project_data: Dict) -> List[Dict[str, Any]]:
-        """Generate abbreviation suggestions"""
-        suggestions = []
-        
-        # Find potential abbreviations in names
-        all_names = (project_data.get('table_names', []) + 
-                    project_data.get('column_names', []))
-        
-        for name in all_names:
-            abbrevs = self._extract_abbreviations(name)
-            for abbrev in abbrevs:
-                full_form = self._expand_abbreviation(abbrev)
-                if full_form:
-                    suggestions.append({
-                        'term': abbrev.upper(),
-                        'auto_definition': f'Abbreviation for {full_form}',
-                        'category': 'abbreviation',
-                        'confidence': 0.6,
-                        'context': f'Found in: {name}',
-                        'suggested_domain': self._infer_domain(name),
-                        'suggested_synonyms': [full_form]
-                    })
-        
-        # Check against common abbreviations
-        for name in all_names:
-            name_parts = re.split(r'[_\s]+', name.lower())
-            for part in name_parts:
-                if part in self.common_abbreviations:
-                    suggestions.append({
-                        'term': part.upper(),
-                        'auto_definition': f'Common abbreviation for {self.common_abbreviations[part]}',
-                        'category': 'abbreviation',
-                        'confidence': 0.8,
-                        'context': f'Common abbreviation found in: {name}',
-                        'suggested_domain': self._infer_domain(name),
-                        'suggested_synonyms': [self.common_abbreviations[part]]
-                    })
-        
-        return self._deduplicate_suggestions(suggestions)
-    
-    def _generate_domain_terms(self, project_data: Dict) -> Dict[str, List[Dict]]:
-        """Generate domain-specific terms"""
-        domain_suggestions = defaultdict(list)
-        
-        # Infer domains from table and column names
-        all_names = (project_data.get('table_names', []) + 
-                    project_data.get('column_names', []))
-        
-        domain_keywords = {
-            'finance': ['revenue', 'cost', 'profit', 'expense', 'budget', 'price', 'amount', 'payment'],
-            'hr': ['employee', 'salary', 'department', 'manager', 'hire', 'staff'],
-            'sales': ['customer', 'order', 'product', 'quantity', 'discount'],
-            'marketing': ['campaign', 'lead', 'conversion', 'click', 'impression'],
-            'inventory': ['stock', 'warehouse', 'supply', 'vendor'],
-            'operations': ['process', 'workflow', 'task', 'status']
-        }
-        
-        for name in all_names:
-            name_lower = name.lower()
-            for domain, keywords in domain_keywords.items():
-                for keyword in keywords:
-                    if keyword in name_lower:
-                        domain_suggestions[domain].append({
-                            'term': name.replace('_', ' ').title(),
-                            'auto_definition': f'{domain.title()} related term',
-                            'category': 'domain_term',
-                            'confidence': 0.7,
-                            'context': f'Domain: {domain}, found in: {name}',
-                            'suggested_domain': domain,
-                            'suggested_synonyms': []
-                        })
-        
-        # Deduplicate within each domain
-        for domain in domain_suggestions:
-            domain_suggestions[domain] = self._deduplicate_suggestions(domain_suggestions[domain])
-        
-        return dict(domain_suggestions)
-    
-    def _enhance_suggestions_with_ai(self, suggestions: Dict, project_data: Dict) -> Dict[str, Any]:
-        """Enhance suggestions using AI"""
-        if not self.client:
-            return suggestions
-        
-        try:
-            # Prepare context for AI
-            context = {
-                'table_names': project_data.get('table_names', [])[:10],
-                'column_names': project_data.get('column_names', [])[:20],
-                'sample_values': project_data.get('sample_values', [])[:10]
-            }
-            
-            # Enhance business terms
-            for suggestion in suggestions.get('business_terms', []):
-                enhanced_def = self._enhance_definition_with_ai(
-                    suggestion['term'], 
-                    suggestion['auto_definition'], 
-                    context
-                )
-                if enhanced_def:
-                    suggestion['enhanced_definition'] = enhanced_def
-                    suggestion['confidence'] = min(1.0, suggestion['confidence'] + 0.1)
-            
-            # Enhance technical terms
-            for suggestion in suggestions.get('technical_terms', []):
-                enhanced_def = self._enhance_definition_with_ai(
-                    suggestion['term'], 
-                    suggestion['auto_definition'], 
-                    context,
-                    is_technical=True
-                )
-                if enhanced_def:
-                    suggestion['enhanced_definition'] = enhanced_def
-                    suggestion['confidence'] = min(1.0, suggestion['confidence'] + 0.1)
-            
-            return suggestions
-            
-        except Exception as e:
-            logger.warning(f"Error enhancing suggestions with AI: {str(e)}")
-            return suggestions
-    
-    def _enhance_definition_with_ai(self, term: str, basic_definition: str, 
-                                  context: Dict, is_technical: bool = False) -> Optional[str]:
-        """Enhance a definition using AI"""
-        try:
-            context_type = "technical database" if is_technical else "business"
-            
-            prompt = f"""
-            Improve this {context_type} definition for the term "{term}":
-            
-            Current definition: {basic_definition}
-            
-            Context from data schema:
-            Tables: {', '.join(context.get('table_names', []))}
-            Columns: {', '.join(context.get('column_names', []))}
-            
-            Provide a clear, concise definition (max 100 words) that would be useful in a data dictionary.
-            """
-            
-            response = self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=[
-                    {"role": "system", "content": "You are a data analyst helping create clear definitions for a data dictionary."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=150,
-                temperature=0.3
+        # Analyze column names
+        for column in table.columns:
+            column_suggestions = self._extract_terms_from_name(
+                column.name, 'column', column.id, f"{table.name}.{column.name}"
             )
-            
-            enhanced_def = response.choices[0].message.content.strip()
-            
-            # Basic validation
-            if len(enhanced_def) > 20 and enhanced_def != basic_definition:
-                return enhanced_def
-            
-            return None
-            
-        except Exception as e:
-            logger.warning(f"Error enhancing definition for {term}: {str(e)}")
-            return None
+            suggestions.extend(column_suggestions)
+        
+        return suggestions
     
-    def _extract_business_terms_from_text(self, text: str) -> List[str]:
-        """Extract potential business terms from text"""
-        terms = []
+    def _extract_terms_from_name(self, name: str, object_type: str, 
+                                object_id: int, full_name: str) -> List[Dict[str, Any]]:
+        """Extract potential business terms from a name"""
+        suggestions = []
+        name_lower = name.lower()
         
-        # Split camelCase and snake_case
-        words = re.findall(r'[A-Z][a-z]+|[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)', text)
-        words.extend(text.split('_'))
+        # Check against business patterns
+        for category, patterns in self.business_patterns.items():
+            for pattern in patterns:
+                if pattern in name_lower:
+                    confidence = self._calculate_confidence(name_lower, pattern, category)
+                    if confidence > 0.3:  # Minimum confidence threshold
+                        suggestion = self._create_suggestion(
+                            name, category, pattern, confidence, 
+                            object_type, object_id, full_name
+                        )
+                        suggestions.append(suggestion)
         
-        # Clean and filter words
-        for word in words:
-            word = word.strip().lower()
-            if (len(word) > 2 and 
-                word not in ['the', 'and', 'or', 'of', 'in', 'to', 'for', 'with'] and
-                word in self.business_keywords):
-                terms.append(word.title())
+        # Check against domain patterns
+        for domain, patterns in self.domain_patterns.items():
+            for pattern in patterns:
+                if pattern in name_lower:
+                    confidence = self._calculate_confidence(name_lower, pattern, domain)
+                    if confidence > 0.3:
+                        suggestion = self._create_domain_suggestion(
+                            name, domain, pattern, confidence,
+                            object_type, object_id, full_name
+                        )
+                        suggestions.append(suggestion)
         
-        return list(set(terms))
+        return suggestions
     
-    def _extract_abbreviations(self, text: str) -> List[str]:
-        """Extract potential abbreviations from text"""
-        abbreviations = []
+    def _calculate_confidence(self, name: str, pattern: str, category: str) -> float:
+        """Calculate confidence score for a term match"""
+        base_confidence = 0.5
         
-        # Look for uppercase letter sequences
-        matches = re.findall(r'[A-Z]{2,}', text)
-        abbreviations.extend(matches)
+        # Exact match gets higher confidence
+        if name == pattern:
+            base_confidence = 0.9
+        elif name.startswith(pattern) or name.endswith(pattern):
+            base_confidence = 0.8
+        elif pattern in name:
+            base_confidence = 0.6
         
-        # Look for patterns like 'id', 'cd', 'no'
-        short_patterns = re.findall(r'\b[a-z]{2,3}\b', text.lower())
-        for pattern in short_patterns:
-            if pattern in self.common_abbreviations:
-                abbreviations.append(pattern)
+        # Adjust based on pattern length and specificity
+        if len(pattern) > 6:  # Longer patterns are more specific
+            base_confidence += 0.1
         
-        return list(set(abbreviations))
+        # Adjust based on category importance
+        important_categories = ['customer', 'revenue', 'transaction']
+        if category in important_categories:
+            base_confidence += 0.1
+        
+        return min(base_confidence, 1.0)
     
-    def _expand_abbreviation(self, abbrev: str) -> Optional[str]:
-        """Expand abbreviation to full form"""
-        abbrev_lower = abbrev.lower()
+    def _create_suggestion(self, name: str, category: str, pattern: str, 
+                         confidence: float, object_type: str, object_id: int,
+                         full_name: str) -> Dict[str, Any]:
+        """Create a dictionary suggestion"""
         
-        if abbrev_lower in self.common_abbreviations:
-            return self.common_abbreviations[abbrev_lower]
-        
-        # Try to guess based on context
-        expansion_patterns = {
-            'id': 'Identifier',
-            'cd': 'Code',
-            'no': 'Number',
-            'qty': 'Quantity',
-            'amt': 'Amount',
-            'desc': 'Description',
-            'addr': 'Address',
-            'ref': 'Reference'
+        # Generate term and definition based on pattern
+        term_mappings = {
+            'customer': {
+                'term': 'Customer',
+                'definition': 'An individual or entity that purchases goods or services from the business'
+            },
+            'revenue': {
+                'term': 'Revenue',
+                'definition': 'The total amount of income generated by the business from its operations'
+            },
+            'transaction': {
+                'term': 'Transaction',
+                'definition': 'A business event or exchange involving the transfer of goods, services, or money'
+            },
+            'product': {
+                'term': 'Product',
+                'definition': 'A good or service offered by the business to customers'
+            },
+            'amount': {
+                'term': 'Amount',
+                'definition': 'A monetary value or quantity associated with a transaction or measurement'
+            },
+            'quantity': {
+                'term': 'Quantity',
+                'definition': 'The number or amount of items, units, or measures'
+            },
+            'status': {
+                'term': 'Status',
+                'definition': 'The current state or condition of an entity or process'
+            },
+            'identifier': {
+                'term': 'Identifier',
+                'definition': 'A unique value used to distinguish and reference a specific entity'
+            }
         }
         
-        return expansion_patterns.get(abbrev_lower)
-    
-    def _infer_domain(self, text: str) -> Optional[str]:
-        """Infer business domain from text"""
-        text_lower = text.lower()
+        mapping = term_mappings.get(category, {
+            'term': pattern.title(),
+            'definition': f'A {category} field containing {pattern} information'
+        })
         
-        domain_indicators = {
-            'finance': ['revenue', 'cost', 'profit', 'expense', 'budget', 'price', 'amount', 'payment', 'invoice'],
-            'hr': ['employee', 'staff', 'salary', 'department', 'manager', 'hire'],
-            'sales': ['customer', 'order', 'product', 'quantity', 'discount', 'sale'],
-            'marketing': ['campaign', 'lead', 'conversion', 'click', 'impression', 'ad'],
-            'inventory': ['stock', 'warehouse', 'supply', 'vendor', 'item'],
-            'operations': ['process', 'workflow', 'task', 'status', 'operation']
+        return {
+            'term': mapping['term'],
+            'definition': mapping['definition'],
+            'category': 'business_term',
+            'domain': self._infer_domain(name),
+            'confidence_score': round(confidence, 3),
+            'source_object_type': object_type,
+            'source_object_id': object_id,
+            'source_name': full_name,
+            'pattern_matched': pattern,
+            'synonyms': self._generate_synonyms(pattern),
+            'abbreviations': self._generate_abbreviations(pattern)
+        }
+    
+    def _create_domain_suggestion(self, name: str, domain: str, pattern: str,
+                                confidence: float, object_type: str, object_id: int,
+                                full_name: str) -> Dict[str, Any]:
+        """Create a domain-specific suggestion"""
+        
+        domain_definitions = {
+            'finance': f'A financial term related to {pattern} in accounting and monetary operations',
+            'hr': f'A human resources term related to {pattern} and employee management',
+            'sales': f'A sales-related term involving {pattern} and customer acquisition',
+            'marketing': f'A marketing term related to {pattern} and customer engagement',
+            'operations': f'An operational term related to {pattern} and business processes'
         }
         
-        for domain, indicators in domain_indicators.items():
-            if any(indicator in text_lower for indicator in indicators):
+        return {
+            'term': pattern.title(),
+            'definition': domain_definitions.get(domain, f'A {domain} term related to {pattern}'),
+            'category': 'domain_term',
+            'domain': domain,
+            'confidence_score': round(confidence, 3),
+            'source_object_type': object_type,
+            'source_object_id': object_id,
+            'source_name': full_name,
+            'pattern_matched': pattern,
+            'synonyms': self._generate_synonyms(pattern),
+            'abbreviations': self._generate_abbreviations(pattern)
+        }
+    
+    def _infer_domain(self, name: str) -> Optional[str]:
+        """Infer the business domain from a name"""
+        name_lower = name.lower()
+        
+        for domain, patterns in self.domain_patterns.items():
+            if any(pattern in name_lower for pattern in patterns):
                 return domain
+        
+        # Default inference based on common patterns
+        if any(word in name_lower for word in ['price', 'cost', 'revenue', 'profit']):
+            return 'finance'
+        elif any(word in name_lower for word in ['employee', 'staff', 'manager']):
+            return 'hr'
+        elif any(word in name_lower for word in ['customer', 'client', 'sale']):
+            return 'sales'
         
         return None
     
-    def _find_synonyms(self, term: str) -> List[str]:
-        """Find potential synonyms for a term"""
+    def _generate_synonyms(self, term: str) -> List[str]:
+        """Generate synonyms for a term"""
         synonym_map = {
-            'customer': ['client', 'buyer'],
-            'product': ['item', 'good'],
-            'order': ['purchase', 'transaction'],
-            'employee': ['staff', 'worker'],
-            'revenue': ['income', 'sales'],
-            'cost': ['expense', 'expenditure']
+            'customer': ['client', 'buyer', 'purchaser'],
+            'revenue': ['income', 'earnings', 'sales'],
+            'transaction': ['payment', 'order', 'purchase'],
+            'product': ['item', 'goods', 'merchandise'],
+            'amount': ['value', 'sum', 'total'],
+            'quantity': ['count', 'number', 'volume'],
+            'status': ['state', 'condition', 'stage'],
+            'id': ['identifier', 'key', 'reference']
         }
         
         return synonym_map.get(term.lower(), [])
     
-    def _deduplicate_suggestions(self, suggestions: List[Dict]) -> List[Dict]:
-        """Remove duplicate suggestions"""
-        seen = set()
+    def _generate_abbreviations(self, term: str) -> List[str]:
+        """Generate common abbreviations for a term"""
+        abbreviation_map = {
+            'customer': ['cust', 'client'],
+            'transaction': ['txn', 'trans'],
+            'quantity': ['qty', 'qnt'],
+            'amount': ['amt'],
+            'identifier': ['id'],
+            'number': ['num', 'no'],
+            'reference': ['ref'],
+            'status': ['stat']
+        }
+        
+        return abbreviation_map.get(term.lower(), [])
+    
+    def _deduplicate_suggestions(self, suggestions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicate suggestions and merge similar ones"""
+        seen_terms = {}
         unique_suggestions = []
         
         for suggestion in suggestions:
             term_key = suggestion['term'].lower()
-            if term_key not in seen:
-                seen.add(term_key)
+            
+            if term_key in seen_terms:
+                # Merge with existing suggestion if this one has higher confidence
+                existing = seen_terms[term_key]
+                if suggestion['confidence_score'] > existing['confidence_score']:
+                    # Update the existing suggestion
+                    existing.update(suggestion)
+            else:
+                seen_terms[term_key] = suggestion
                 unique_suggestions.append(suggestion)
         
         return unique_suggestions
     
-    def _filter_and_rank_suggestions(self, suggestions: Dict, project_id: int) -> Dict[str, Any]:
-        """Filter and rank suggestions"""
-        # Get existing terms to avoid duplicates
-        existing_terms = set(
-            term.term.lower() for term in 
-            DictionaryEntry.query.filter_by(project_id=project_id).all()
-        )
-        
-        # Filter and rank each category
-        for category in suggestions:
-            if isinstance(suggestions[category], list):
-                # Filter out existing terms
-                filtered = [
-                    s for s in suggestions[category] 
-                    if s['term'].lower() not in existing_terms
-                ]
-                
-                # Sort by confidence
-                filtered.sort(key=lambda x: x['confidence'], reverse=True)
-                
-                # Limit results
-                suggestions[category] = filtered[:20]
+    def create_entry_from_suggestion(self, project_id: int, 
+                                   suggestion: Dict[str, Any]) -> DictionaryEntry:
+        """Create a dictionary entry from a suggestion"""
+        try:
+            entry = DictionaryEntry(
+                project_id=project_id,
+                term=suggestion['term'],
+                definition=suggestion['definition'],
+                category=suggestion.get('category', 'business_term'),
+                domain=suggestion.get('domain'),
+                synonyms=suggestion.get('synonyms', []),
+                abbreviations=suggestion.get('abbreviations', []),
+                status='draft',
+                is_auto_generated=True,
+                confidence_score=suggestion.get('confidence_score'),
+                source_tables=json.dumps([suggestion.get('source_name')]) if suggestion.get('source_name') else None,
+                created_by='system'
+            )
             
-            elif isinstance(suggestions[category], dict):
-                # Handle domain terms
-                for domain in suggestions[category]:
-                    filtered = [
-                        s for s in suggestions[category][domain]
-                        if s['term'].lower() not in existing_terms
-                    ]
-                    filtered.sort(key=lambda x: x['confidence'], reverse=True)
-                    suggestions[category][domain] = filtered[:10]
-        
-        return suggestions
+            db.session.add(entry)
+            db.session.commit()
+            
+            return entry
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error creating dictionary entry from suggestion: {str(e)}")
+            raise
     
-    def _count_suggestions(self, suggestions: Dict) -> int:
-        """Count total suggestions"""
-        count = 0
-        for category, items in suggestions.items():
-            if isinstance(items, list):
-                count += len(items)
-            elif isinstance(items, dict):
-                for domain_items in items.values():
-                    count += len(domain_items)
-        return count
+    def bulk_create_from_suggestions(self, project_id: int, 
+                                   suggestions: List[Dict[str, Any]]) -> int:
+        """Create multiple dictionary entries from suggestions"""
+        try:
+            created_count = 0
+            
+            for suggestion in suggestions:
+                try:
+                    # Check if term already exists
+                    existing = DictionaryEntry.query.filter_by(
+                        project_id=project_id,
+                        term=suggestion['term']
+                    ).first()
+                    
+                    if not existing:
+                        self.create_entry_from_suggestion(project_id, suggestion)
+                        created_count += 1
+                    else:
+                        logger.info(f"Term '{suggestion['term']}' already exists, skipping")
+                        
+                except Exception as e:
+                    logger.warning(f"Error creating entry for term '{suggestion.get('term', 'unknown')}': {str(e)}")
+                    continue
+            
+            return created_count
+            
+        except Exception as e:
+            logger.error(f"Error in bulk creation: {str(e)}")
+            raise
     
-    def _load_common_abbreviations(self) -> Dict[str, str]:
-        """Load common abbreviations mapping"""
-        return {
-            'id': 'Identifier',
-            'cd': 'Code',
-            'no': 'Number',
-            'qty': 'Quantity',
-            'amt': 'Amount',
-            'desc': 'Description',
-            'addr': 'Address',
-            'ref': 'Reference',
-            'dept': 'Department',
-            'mgr': 'Manager',
-            'emp': 'Employee',
-            'cust': 'Customer',
-            'prod': 'Product',
-            'ord': 'Order',
-            'inv': 'Invoice',
-            'acct': 'Account',
-            'bal': 'Balance',
-            'calc': 'Calculated',
-            'ctrl': 'Control',
-            'stat': 'Status',
-            'sys': 'System',
-            'tmp': 'Temporary',
-            'usr': 'User',
-            'grp': 'Group',
-            'org': 'Organization',
-            'loc': 'Location',
-            'cat': 'Category',
-            'type': 'Type',
-            'src': 'Source',
-            'tgt': 'Target',
-            'min': 'Minimum',
-            'max': 'Maximum',
-            'avg': 'Average',
-            'cnt': 'Count',
-            'sum': 'Sum',
-            'pct': 'Percent'
-        }
+    def update_entry(self, entry_id: int, updates: Dict[str, Any]) -> DictionaryEntry:
+        """Update a dictionary entry"""
+        try:
+            entry = DictionaryEntry.query.get(entry_id)
+            if not entry:
+                raise ValueError(f"Dictionary entry {entry_id} not found")
+            
+            # Update allowed fields
+            allowed_fields = [
+                'term', 'definition', 'category', 'domain', 'synonyms',
+                'abbreviations', 'status', 'approved_by'
+            ]
+            
+            for field, value in updates.items():
+                if field in allowed_fields and hasattr(entry, field):
+                    setattr(entry, field, value)
+            
+            # Set approval timestamp if status changes to approved
+            if updates.get('status') == 'approved' and entry.status != 'approved':
+                entry.approved_at = datetime.utcnow()
+            
+            entry.updated_at = datetime.utcnow()
+            db.session.commit()
+            
+            return entry
+            
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error updating dictionary entry: {str(e)}")
+            raise
     
-    def _load_business_keywords(self) -> Set[str]:
-        """Load business keywords for term extraction"""
-        return {
-            'customer', 'client', 'buyer', 'user', 'account', 'contact',
-            'product', 'service', 'item', 'good', 'offering',
-            'order', 'purchase', 'transaction', 'sale', 'deal',
-            'revenue', 'income', 'profit', 'cost', 'expense', 'budget',
-            'price', 'amount', 'value', 'total', 'sum',
-            'employee', 'staff', 'worker', 'manager', 'team',
-            'department', 'division', 'unit', 'group', 'organization',
-            'campaign', 'marketing', 'promotion', 'advertisement',
-            'lead', 'prospect', 'opportunity', 'conversion',
-            'inventory', 'stock', 'warehouse', 'supply', 'vendor',
-            'process', 'workflow', 'task', 'project', 'activity',
-            'report', 'dashboard', 'analytics', 'metric', 'kpi',
-            'date', 'time', 'period', 'quarter', 'year',
-            'status', 'state', 'condition', 'flag', 'indicator',
-            'category', 'type', 'class', 'segment', 'group',
-            'location', 'region', 'country', 'city', 'address',
-            'contract', 'agreement', 'policy', 'terms',
-            'payment', 'invoice', 'billing', 'charge', 'fee'
-        }
+    def search_entries(self, project_id: int, query: str, 
+                      filters: Optional[Dict[str, Any]] = None) -> List[DictionaryEntry]:
+        """Search dictionary entries"""
+        try:
+            base_query = DictionaryEntry.query.filter_by(project_id=project_id)
+            
+            # Apply text search
+            if query:
+                search_filter = (
+                    DictionaryEntry.term.ilike(f'%{query}%') |
+                    DictionaryEntry.definition.ilike(f'%{query}%')
+                )
+                base_query = base_query.filter(search_filter)
+            
+            # Apply filters
+            if filters:
+                if filters.get('category'):
+                    base_query = base_query.filter_by(category=filters['category'])
+                if filters.get('domain'):
+                    base_query = base_query.filter_by(domain=filters['domain'])
+                if filters.get('status'):
+                    base_query = base_query.filter_by(status=filters['status'])
+            
+            return base_query.order_by(DictionaryEntry.term).all()
+            
+        except Exception as e:
+            logger.error(f"Error searching dictionary entries: {str(e)}")
+            raise
+    
+    def get_statistics(self, project_id: int) -> Dict[str, Any]:
+        """Get dictionary statistics for a project"""
+        try:
+            entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
+            
+            # Count by category
+            categories = Counter(entry.category for entry in entries if entry.category)
+            
+            # Count by domain
+            domains = Counter(entry.domain for entry in entries if entry.domain)
+            
+            # Count by status
+            statuses = Counter(entry.status for entry in entries if entry.status)
+            
+            # Count auto-generated vs manual
+            auto_generated = len([e for e in entries if e.is_auto_generated])
+            manual = len(entries) - auto_generated
+            
+            return {
+                'total_entries': len(entries),
+                'categories': dict(categories),
+                'domains': dict(domains),
+                'statuses': dict(statuses),
+                'auto_generated': auto_generated,
+                'manual': manual,
+                'completion_rate': round(
+                    len([e for e in entries if e.status == 'approved']) / len(entries) * 100, 1
+                ) if entries else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting dictionary statistics: {str(e)}")
+            raise
+    
+    def export_dictionary(self, project_id: int, format: str = 'json') -> Dict[str, Any]:
+        """Export dictionary entries"""
+        try:
+            entries = DictionaryEntry.query.filter_by(project_id=project_id).all()
+            
+            export_data = []
+            for entry in entries:
+                export_data.append({
+                    'term': entry.term,
+                    'definition': entry.definition,
+                    'category': entry.category,
+                    'domain': entry.domain,
+                    'synonyms': entry.synonyms or [],
+                    'abbreviations': entry.abbreviations or [],
+                    'status': entry.status,
+                    'created_at': entry.created_at.isoformat() if entry.created_at else None,
+                    'updated_at': entry.updated_at.isoformat() if entry.updated_at else None
+                })
+            
+            return {
+                'project_id': project_id,
+                'exported_at': datetime.utcnow().isoformat(),
+                'total_entries': len(export_data),
+                'entries': export_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Error exporting dictionary: {str(e)}")
+            raise
